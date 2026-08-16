@@ -1,0 +1,1344 @@
+"""
+14_stage4b_ar1_guided_generator.py
+==================================
+Stage 4B: AR(1)-guided observation-space residual generator.
+
+This version is explicitly guided by AR(1) dynamics rather than a generic
+residual head. The generator predicts per-feature autoregressive parameters
+from the prefix context and uses them to generate residual trajectories.
+
+Key idea:
+  - predict rho and sigma from context
+  - generate residuals via delta_t = rho * delta_{t-1} + sqrt(1-rho^2) * sigma * eps
+  - fit rho and sigma to empirical residual autocorrelation / variance from
+    the deterministic backbone forecast
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+import importlib.util
+import pickle
+import random
+from typing import Dict, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+import config as cfg
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _load_stage4a_module():
+    path = os.path.join(BASE_DIR, "13_stage4a_residual_generator.py")
+    spec = importlib.util.spec_from_file_location("_pi_stage4a_impl", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+stage4a_mod = _load_stage4a_module()
+
+
+# Reuse helper logic from Stage 4A
+_load_all = stage4a_mod._load_all
+_build_model = stage4a_mod._build_model
+_cache_trajectories = stage4a_mod._cache_trajectories
+crps_mc_loss = stage4a_mod.crps_mc_loss
+pinball_loss = stage4a_mod.pinball_loss
+
+
+# Validated setting (2026-08-11): stable across 3 seeds and better than AR(1) baseline.
+STAGE4B_EPOCHS = 20
+STAGE4B_N_TRAIN_SAMPLES = 4
+STAGE4B_N_VAL_SAMPLES = 20
+STAGE4B_LR = 4e-4
+STAGE4B_PATIENCE = 8
+STAGE4B_HIDDEN_DIM = 96
+STAGE4B_NOISE_DIM = 16
+
+LAMBDA_CRPS = 1.0
+LAMBDA_AR1 = 0.50
+LAMBDA_VAR = 0.30
+LAMBDA_PINBALL = 0.10
+LAMBDA_SCALE = 0.01
+DEFAULT_SIGMA_MIN = 0.012
+DEFAULT_LOG_SCALE_FLOOR_INIT = -2.6
+
+# Indices for leakage features whose mean residual may be non-zero
+_LEAKAGE_FEAT_INDICES = [cfg.IDLEAK_DECODER_ROW, cfg.IGLEAK_DECODER_ROW]  # [4, 5]
+_LEAKAGE_BIAS_BOUND = 0.30  # tanh-bounded: max |bias| in normalised space
+
+# Stable features: those used in Stage 4C / Stage 5 adversarial training.
+# IDLeak (4) and IGLeak (5) are EXCLUDED from the generator and discriminator;
+# Stage 3 deterministic predictions are used as auxiliary outputs for them.
+STABLE_FEAT_INDICES = [0, 1, 2, 3]   # Vth, IDSS, RON, gmmax
+N_STABLE_FEATURES   = len(STABLE_FEAT_INDICES)
+
+
+def _temp_equalized_var_loss(
+    sigma_pred: "torch.Tensor",
+    sigma_target: "torch.Tensor",
+    T_K: "torch.Tensor",
+) -> "torch.Tensor":
+    """Variance MSE with equal weight per temperature bucket.
+
+    Each unique temperature group (275/300/325 °C) contributes equally to the
+    total loss regardless of how many devices fall in that group.  This prevents
+    the high-sample-count temperature from dominating and ensures 325 °C (often
+    under-represented and hardest to fit) receives equal attention.
+    """
+    import torch
+    temps_c = torch.round(T_K - 273.15).long()
+    unique_temps = torch.unique(temps_c)
+    per_temp_losses = []
+    for tc in unique_temps:
+        idx = (temps_c == tc).nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            continue
+        per_temp_losses.append(((sigma_pred[idx] - sigma_target[idx]) ** 2).mean())
+    if not per_temp_losses:
+        return torch.tensor(0.0, device=sigma_pred.device, dtype=sigma_pred.dtype)
+    return torch.stack(per_temp_losses).mean()
+
+
+LAMBDA_CALIB = 0.0   # default off; set > 0 to activate coverage-calibration loss
+CALIB_LEVELS = (0.50, 0.80, 0.90)   # nominal central-interval coverage targets
+
+
+def coverage_calibration_loss(
+    samples: "torch.Tensor",   # (S, B, T, F) predicted trajectories (prefix+future)
+    x_true:  "torch.Tensor",   # (B, T, F)
+    mask:    "torch.Tensor",   # (B, T)
+    prefix_len: int,
+    levels: tuple = CALIB_LEVELS,
+) -> "torch.Tensor":
+    """Direct calibration loss: penalise the squared gap between empirical
+    coverage of the sample-based central interval and its nominal level.
+
+    For each level p in `levels`, forms the [ (1-p)/2, (1+p)/2 ] empirical
+    quantile interval from `samples` (differentiable via soft comparison of
+    each sample against the true value, i.e. a smoothed indicator), and
+    penalises (empirical_coverage - p)^2.
+
+    Unlike CRPS (which only rewards sharpness+accuracy jointly), this term
+    directly targets interval calibration, closing the loop between what is
+    optimised during training and what coverage_XX_overall measures at eval
+    time — CRPS alone can be minimised by a systematically under-dispersed
+    (over-confident) generator, which is exactly the Cov90 << 0.90 failure
+    mode observed empirically.
+    """
+    S, B, T, F = samples.shape
+    future_mask = mask.clone()
+    future_mask[:, :prefix_len] = 0.0
+    valid = (future_mask > 0).unsqueeze(-1) & ~torch.isnan(x_true)   # (B, T, F)
+    if valid.sum() == 0:
+        return samples.mean() * 0.0
+
+    x_true_c = torch.nan_to_num(x_true, nan=0.0)
+    samples_c = torch.nan_to_num(samples, nan=0.0)
+
+    total = torch.zeros((), device=samples.device, dtype=samples.dtype)
+    for p in levels:
+        lo_q, hi_q = (1.0 - p) / 2.0, (1.0 + p) / 2.0
+        lo = torch.quantile(samples_c, lo_q, dim=0)   # (B, T, F)
+        hi = torch.quantile(samples_c, hi_q, dim=0)   # (B, T, F)
+        # Smooth (differentiable) inside-interval indicator via sigmoid soft-step,
+        # scaled by the interval half-width so the softness adapts to local spread.
+        width = (hi - lo).clamp(min=1e-4)
+        sharpness = 8.0 / width
+        inside = torch.sigmoid(sharpness * (x_true_c - lo)) * torch.sigmoid(sharpness * (hi - x_true_c))
+        empirical_cov = (inside * valid.float()).sum() / valid.float().sum().clamp(min=1)
+        total = total + (empirical_cov - p) ** 2
+    return total / len(levels)
+
+
+LAMBDA_PHYS_SENS = 0.0   # default off; set > 0 to activate physics-latent sensitivity loss
+PHYS_SENS_MARGIN = 0.05  # minimum required (rho,sigma) response to a shuffled z_phys, normalised
+
+
+def physics_sensitivity_loss(
+    generator,
+    z_pfx: "torch.Tensor",   # (B, latent_dim) real physics latent state
+    T_K: "torch.Tensor",
+    x0: "torch.Tensor",
+    log_t: "torch.Tensor",
+    margin: float = PHYS_SENS_MARGIN,
+) -> "torch.Tensor":
+    """Penalise the generator for being insensitive to z_phys.
+
+    Ablation A/B/C showed the Stage 4C generator's CRPSS/coverage are
+    statistically indistinguishable whether z_phys is real, zeroed, or
+    shuffled across the batch — i.e. the network learned to ignore the
+    physics latent state and rely on T/t/x0 alone.  Nonzero gradients
+    through z_phys don't guarantee the *prediction* actually depends on it
+    in a way that matters, so this loss targets that directly: it shuffles
+    z_phys across the batch (same device's T/t/x0 kept fixed) and requires
+    the predicted (rho, sigma) to differ from the real-z_phys prediction by
+    at least `margin` (normalised, hinge-penalised below the margin).
+
+    This does not by itself guarantee the *correct* use of z_phys — a
+    network could satisfy this by reacting to z_phys noise arbitrarily. It
+    is a necessary-but-not-sufficient condition, meant to be combined with
+    re-running the A/B/C ablation to confirm CRPSS/coverage/OOD-temperature
+    performance improves with real z_phys relative to shuffled — that is
+    the actual test of whether the sensitivity is meaningful, not just present.
+    """
+    import torch
+    B = z_pfx.shape[0]
+    if B <= 1:
+        return z_pfx.sum() * 0.0
+
+    rho_real, sigma_real = generator._context_params(z_pfx, T_K, x0, log_t)
+
+    perm = torch.randperm(B, device=z_pfx.device)
+    z_shuffled = z_pfx[perm]
+    rho_shuf, sigma_shuf = generator._context_params(z_shuffled, T_K, x0, log_t)
+
+    rho_diff = (rho_real - rho_shuf).abs().mean(dim=-1)      # (B,)
+    sigma_diff = ((sigma_real - sigma_shuf).abs() / sigma_real.detach().clamp(min=1e-4)).mean(dim=-1)  # (B,)
+    response = 0.5 * (rho_diff + sigma_diff)                  # (B,)
+
+    return torch.relu(margin - response).mean()
+
+
+LAMBDA_ACF = 0.0   # default off; set e.g. 0.10 for Stage 4C-ACF variant
+
+
+def _batch_acf_at_lag(
+    residuals: "torch.Tensor",
+    valid_mask: "torch.Tensor",
+    lag: int,
+) -> "torch.Tensor":
+    """Estimate index-based autocorrelation at given lag.
+
+    residuals  : (B, T, F)  zero-mean residuals
+    valid_mask : (B, T)     True for valid time steps
+    Returns    : (F,)       ACF estimate per feature
+    """
+    import torch
+    B, T, F = residuals.shape
+    if T <= lag:
+        return torch.zeros(F, device=residuals.device, dtype=residuals.dtype)
+
+    res = torch.nan_to_num(residuals, nan=0.0)
+    # Paired mask: both t and t+lag must be valid
+    pair_mask = (valid_mask[:, :T - lag].float() * valid_mask[:, lag:].float())  # (B, T-lag)
+    n_pairs = pair_mask.sum().clamp(min=2.0)
+
+    r_t    = res[:, :T - lag, :]   # (B, T-lag, F)
+    r_tlag = res[:, lag:,     :]   # (B, T-lag, F)
+    w      = pair_mask.unsqueeze(-1)  # (B, T-lag, 1)
+
+    mu_t   = (r_t   * w).sum(dim=[0, 1]) / n_pairs  # (F,)
+    mu_lag = (r_tlag * w).sum(dim=[0, 1]) / n_pairs  # (F,)
+
+    dt   = (r_t   - mu_t)   * w   # (B, T-lag, F)
+    dlag = (r_tlag - mu_lag) * w   # (B, T-lag, F)
+
+    cov    = (dt * dlag).sum(dim=[0, 1])          # (F,)
+    var_t  = (dt   ** 2).sum(dim=[0, 1]).clamp(min=1e-8)   # (F,)
+    var_l  = (dlag ** 2).sum(dim=[0, 1]).clamp(min=1e-8)   # (F,)
+
+    return (cov / torch.sqrt(var_t * var_l)).clamp(-1.0, 1.0)
+
+
+def acf_matching_loss(
+    deltas: "torch.Tensor",         # (S, B, T_future, F_s)  generated residuals
+    x_true: "torch.Tensor",         # (B, T, F_all)
+    x_hat:  "torch.Tensor",         # (B, T, F_all)
+    mask:   "torch.Tensor",         # (B, T)
+    prefix_len: int,
+    stable_feat_indices: list,
+    max_lag: int = 2,
+    weights = None,
+) -> "torch.Tensor":
+    """Index-based ACF matching loss.
+
+    L_ACF = (1/F) sum_f sum_{l=1}^{max_lag}  w_l * (rho_gen_f(l) - rho_real_f(l))^2
+
+    Designed for Stage 4C training to improve temporal correlation of generated
+    residuals without increasing the adversarial weight.
+    """
+    import torch
+    if weights is None:
+        weights = [1.0, 0.5]   # lag-1 weight=1.0, lag-2 weight=0.5
+
+    sfx = torch.tensor(stable_feat_indices, device=deltas.device)
+    future_mask = mask[:, prefix_len:].bool()           # (B, T_future)
+
+    # True residuals in future window (stable features)
+    r_real = (x_true[:, prefix_len:, sfx] - x_hat[:, prefix_len:, sfx]).detach()  # (B, T_f, F_s)
+
+    S = deltas.shape[0]
+    n_lags = min(max_lag, len(weights))
+    total = torch.zeros(1, device=deltas.device, dtype=deltas.dtype)
+
+    for li in range(n_lags):
+        lag = li + 1
+        w   = weights[li]
+        rho_real = _batch_acf_at_lag(r_real, future_mask, lag)          # (F_s,)
+        rho_gen  = torch.stack([
+            _batch_acf_at_lag(deltas[s], future_mask, lag) for s in range(S)
+        ]).mean(dim=0)                                                   # (F_s,)
+        total = total + w * ((rho_gen - rho_real) ** 2).mean()
+
+    return total / max(n_lags, 1)
+
+
+class AR1GuidedResidualGenerator(nn.Module):
+    """AR(1)-guided observation-space residual generator."""
+
+    def __init__(
+        self,
+        noise_dim: int = STAGE4B_NOISE_DIM,
+        hidden_dim: int = STAGE4B_HIDDEN_DIM,
+        n_features: int = cfg.FEATURE_DIM,
+        latent_dim: int = cfg.LATENT_DIM,
+        log_scale_floor_init: float = DEFAULT_LOG_SCALE_FLOOR_INIT,
+    ):
+        super().__init__()
+        self.noise_dim = noise_dim
+        self.n_features = n_features
+        self.latent_dim = latent_dim
+
+        context_dim = latent_dim + 1 + n_features + 1
+        in_dim = noise_dim + context_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2 * n_features),
+        )
+
+        self.log_scale_floor = nn.Parameter(torch.full((n_features,), float(log_scale_floor_init)))
+
+        # Independent bias head for leakage features (IDLeak, IGLeak).
+        # Learns a deterministic, context-dependent mean correction for each
+        # leakage feature so the stochastic AR(1) residuals can remain zero-mean.
+        self._leakage_indices = _LEAKAGE_FEAT_INDICES
+        n_leakage = len(self._leakage_indices)
+        self.leakage_bias_head = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, n_leakage),
+        )
+        # Initialise to zero so the bias starts at no-correction
+        nn.init.zeros_(self.leakage_bias_head[-1].weight)
+        nn.init.zeros_(self.leakage_bias_head[-1].bias)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.15)
+                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def _compute_leakage_bias(
+        self,
+        z_prefix_last: "torch.Tensor",
+        T_K: "torch.Tensor",
+        x0: "torch.Tensor",
+        log_t_suffix: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return a bounded (B, n_leakage) bias for IDLeak / IGLeak.
+
+        The bias is deterministic (context-only, no noise) and bounded to
+        ±LEAKAGE_BIAS_BOUND in normalised space via tanh.  The AR(1) stochastic
+        residuals remain zero-mean and are added on top of this correction.
+        """
+        import torch
+        z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5)
+        x0 = torch.nan_to_num(x0, nan=0.0)
+        T_K = torch.nan_to_num(T_K, nan=0.0)
+        log_t_suffix = torch.nan_to_num(log_t_suffix, nan=0.0)
+
+        B = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+
+        if T_K.dim() <= 1:
+            T_norm = ((T_K.reshape(-1) - 300.0) / 25.0).reshape(B, 1)
+        else:
+            T_norm = T_K.reshape(B, -1)[:, :1]
+
+        if x0.dim() == 1:
+            x0 = x0.unsqueeze(0)
+        if x0.dim() > 2:
+            x0 = x0.reshape(B, -1)
+        if x0.shape[0] != B:
+            x0 = x0.expand(B, -1)
+
+        if log_t_suffix.dim() == 1:
+            log_t = log_t_suffix.reshape(B, 1)
+        else:
+            log_t = log_t_suffix.reshape(B, -1)[:, :1]
+
+        ctx = torch.cat([z_prefix_last.reshape(B, -1), T_norm, x0.reshape(B, -1), log_t], dim=-1)
+        raw = self.leakage_bias_head(ctx)          # (B, n_leakage)
+        return _LEAKAGE_BIAS_BOUND * torch.tanh(raw)
+
+    def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
+        z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
+        x0 = torch.nan_to_num(x0, nan=0.0, posinf=0.0, neginf=0.0)
+        T_K = torch.nan_to_num(T_K, nan=0.0, posinf=0.0, neginf=0.0)
+        log_t_suffix = torch.nan_to_num(log_t_suffix, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if z_prefix_last.dim() == 1:
+            z_prefix_last = z_prefix_last.unsqueeze(0)
+        B = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+
+        if T_K.dim() == 0:
+            T_K = T_K.unsqueeze(0)
+        if T_K.dim() == 1:
+            T_norm = ((T_K - 300.0) / 25.0).reshape(B, -1)[:, :1]
+        else:
+            T_norm = T_K.reshape(B, -1)[:, :1]
+
+        if x0.dim() == 1:
+            x0 = x0.unsqueeze(0)
+        if x0.dim() > 2:
+            x0 = x0.reshape(B, -1)
+        if x0.shape[0] != B:
+            x0 = x0.expand(B, -1)
+
+        if log_t_suffix.dim() == 1:
+            log_t_suffix = log_t_suffix.reshape(B, -1)
+        elif log_t_suffix.dim() > 2:
+            log_t_suffix = log_t_suffix.reshape(B, -1)
+        log_t = log_t_suffix.reshape(B, -1)[:, :1]
+
+        ctx = torch.cat([z_prefix_last.reshape(B, -1), T_norm, x0.reshape(B, -1), log_t], dim=-1)
+        if len(ctx.shape) == 1:
+            ctx = ctx.unsqueeze(0)
+        if ctx.shape[-1] != self.latent_dim + 1 + self.n_features + 1:
+            target_dim = self.latent_dim + 1 + self.n_features + 1
+            if ctx.shape[-1] > target_dim:
+                ctx = ctx[:, :target_dim]
+            else:
+                pad = torch.zeros(B, target_dim - ctx.shape[-1], device=dev, dtype=ctx.dtype)
+                ctx = torch.cat([ctx, pad], dim=-1)
+
+        # Keep parameter prediction deterministic by default.
+        # Stochasticity for trajectories is already injected in the AR(1) innovation eps.
+        if noise_init is None:
+            noise_init = torch.zeros(B, self.noise_dim, device=dev, dtype=ctx.dtype)
+        else:
+            noise_init = torch.nan_to_num(noise_init, nan=0.0, posinf=0.0, neginf=0.0)
+            if noise_init.dim() == 1:
+                noise_init = noise_init.unsqueeze(0)
+            if noise_init.shape[0] != B:
+                noise_init = noise_init.expand(B, -1)
+        inp = torch.cat([noise_init, ctx], dim=-1)
+        out = self.net(inp)
+        rho_raw = out[:, : self.n_features]
+        log_sigma_raw = out[:, self.n_features :]
+
+        rho = torch.tanh(rho_raw).clamp(-0.95, 0.95)
+        sigma_floor = torch.exp(self.log_scale_floor).unsqueeze(0).expand(B, -1)
+        sigma = sigma_floor + F.softplus(log_sigma_raw)
+        return rho, sigma
+
+    def forward(self, z_prefix_last, T_K, x0, log_t_suffix, T_future=10, noise=None):
+        B = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+        rho, sigma = self._context_params(z_prefix_last, T_K, x0, log_t_suffix)
+
+        # --- Zero-mean AR(1) stochastic residuals ---
+        deltas = []
+        d_prev = torch.zeros(B, self.n_features, device=dev)
+        for _ in range(T_future):
+            eps = torch.randn(B, self.n_features, device=dev)
+            sq = torch.sqrt((1.0 - rho ** 2).clamp(min=1e-6))
+            d_t = rho * d_prev + sq * sigma * eps
+            deltas.append(d_t)
+            d_prev = d_t.detach()
+
+        stoch = torch.stack(deltas, dim=1)   # (B, T_future, F) — zero-mean in expectation
+
+        # --- Deterministic leakage bias correction ---
+        # Bounded ±LEAKAGE_BIAS_BOUND for IDLeak / IGLeak; zero for all other features.
+        bias = torch.zeros(B, self.n_features, device=dev)
+        leakage_bias = self._compute_leakage_bias(z_prefix_last, T_K, x0, log_t_suffix)  # (B, n_leakage)
+        for local_i, feat_i in enumerate(self._leakage_indices):
+            bias[:, feat_i] = leakage_bias[:, local_i]
+
+        return stoch + bias.unsqueeze(1)     # (B, T_future, F)
+
+    def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10):
+        deltas = [
+            self.forward(z_prefix_last, T_K, x0, log_t_suffix, T_future=T_future)
+            for _ in range(n_samples)
+        ]
+        return torch.stack(deltas, dim=0)
+
+
+class AR1GuidedResidualGeneratorStable(nn.Module):
+    """Stage 4C: AR(1) generator for stable features ONLY (Vth, IDSS, RON, gmmax).
+
+    IDLeak and IGLeak are EXCLUDED from generation and adversarial training.
+    Stage 3 deterministic predictions serve as their auxiliary outputs.
+
+    Architecture:
+    - Context uses the full 6-dim x0 vector (richer conditioning).
+    - Network outputs 2 × 4 = 8 values → rho + sigma for 4 stable features.
+    - No leakage bias head.
+    - forward / sample_n output shape: (B, T_future, 4) / (S, B, T_future, 4).
+    """
+    STABLE_INDICES = STABLE_FEAT_INDICES   # [0, 1, 2, 3]
+    N_STABLE       = N_STABLE_FEATURES     # 4
+
+    def __init__(
+        self,
+        noise_dim:           int   = STAGE4B_NOISE_DIM,
+        hidden_dim:          int   = STAGE4B_HIDDEN_DIM,
+        n_output:            int   = N_STABLE_FEATURES,
+        latent_dim:          int   = cfg.LATENT_DIM,
+        n_context_feat:      int   = cfg.FEATURE_DIM,   # full 6-dim x0 context
+        log_scale_floor_init:float = DEFAULT_LOG_SCALE_FLOOR_INIT,
+    ):
+        super().__init__()
+        self.noise_dim      = noise_dim
+        self.n_features     = n_output          # 4
+        self.latent_dim     = latent_dim
+        self._n_ctx_feat    = n_context_feat    # 6
+        self._leakage_indices = []              # no leakage bias
+
+        context_dim = latent_dim + 1 + n_context_feat + 1
+        in_dim      = noise_dim + context_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2 * n_output),
+        )
+        self.log_scale_floor = nn.Parameter(
+            torch.full((n_output,), float(log_scale_floor_init))
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.15)
+                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
+        """Return (rho, sigma) tensors shaped (B, 4) for the 4 stable features."""
+        z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
+        x0            = torch.nan_to_num(x0,            nan=0.0, posinf=0.0, neginf=0.0)
+        T_K           = torch.nan_to_num(T_K,           nan=0.0, posinf=0.0, neginf=0.0)
+        log_t_suffix  = torch.nan_to_num(log_t_suffix,  nan=0.0, posinf=0.0, neginf=0.0)
+
+        if z_prefix_last.dim() == 1:
+            z_prefix_last = z_prefix_last.unsqueeze(0)
+        B   = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+
+        T_norm = ((T_K.reshape(-1) - 300.0) / 25.0).reshape(B, 1)
+        if x0.dim() == 1:
+            x0 = x0.unsqueeze(0)
+        if x0.dim() > 2:
+            x0 = x0.reshape(B, -1)
+        x0_ctx = x0[:, :self._n_ctx_feat]   # first 6 dims (or however many exist)
+
+        log_t = log_t_suffix.reshape(B, -1)[:, :1]
+
+        ctx = torch.cat([z_prefix_last.reshape(B, -1), T_norm, x0_ctx.reshape(B, -1), log_t], dim=-1)
+
+        if noise_init is None:
+            noise_init = torch.zeros(B, self.noise_dim, device=dev, dtype=ctx.dtype)
+        else:
+            noise_init = torch.nan_to_num(noise_init, nan=0.0)
+            if noise_init.dim() == 1:
+                noise_init = noise_init.unsqueeze(0)
+
+        inp      = torch.cat([noise_init, ctx], dim=-1)
+        out      = self.net(inp)
+        # Positive-only rho: sigmoid * 0.97  so rho in (0, 0.97)
+        # Removes the sign×abs^expo NaN hazard and restricts to decay-only OU.
+        rho      = torch.sigmoid(out[:, :self.n_features]) * 0.97
+        sig_floor= torch.exp(self.log_scale_floor).unsqueeze(0).expand(B, -1)
+        sigma    = sig_floor + F.softplus(out[:, self.n_features:])
+        return rho, sigma
+
+    # Reference log10-time step (≈ median Δlog10t on the future window of this dataset)
+    # Future times: 10, 20, 50, 100, 200, 500, 1000, 2000 h → Δlog10 ≈ 0.30–0.40
+    LOG10_T_REF = 0.35   # reference Deltalog10(1+t) step for the OU parameterisation
+
+    def forward(self, z_prefix_last, T_K, x0, log_t_suffix, T_future=10, noise=None,
+                times_future=None):
+        """Continuous-time OU on the log10(1+t) axis.
+
+        rho_eff(i) = rho_ref ^ (Deltalog10(1+t_i) / LOG10_T_REF)
+
+        log10(1+t) handles t=0 gracefully.
+        rho_ref is in (0, 0.97) so rho_eff is always a valid decay coefficient;
+        no NaN from non-integer exponentiation of negative numbers.
+        sqrt(1-rho_i^2) is included as innovation scale at every step.
+        """
+        B   = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+        rho, sigma = self._context_params(z_prefix_last, T_K, x0, log_t_suffix)
+
+        rho_eff_per_step = None
+        if times_future is not None and times_future.shape[1] >= 2:
+            t = times_future.to(dev).clamp(min=0.0)      # (B, T_future)
+            log1pt = torch.log10(1.0 + t)                 # log10(1+t)
+            delta_log10 = torch.zeros(B, T_future, device=dev)
+            delta_log10[:, 0] = self.LOG10_T_REF           # first step: reference interval
+            if T_future > 1:
+                delta_log10[:, 1:] = (
+                    log1pt[:, 1:] - log1pt[:, :-1]
+                ).clamp(min=0.01, max=2.0)
+            expo = (delta_log10 / self.LOG10_T_REF).unsqueeze(-1)  # (B, T_future, 1)
+            # rho in (0, 0.97), expo > 0  =>  rho^expo in (0, 0.97): always real
+            rho_eff_per_step = rho.unsqueeze(1) ** expo             # (B, T_future, F)
+
+        deltas = []
+        d_prev = torch.zeros(B, self.n_features, device=dev)
+        for t_idx in range(T_future):
+            eps   = torch.randn(B, self.n_features, device=dev)
+            rho_i = rho_eff_per_step[:, t_idx, :] if rho_eff_per_step is not None else rho
+            sq    = torch.sqrt((1.0 - rho_i ** 2).clamp(min=1e-6))  # innovation scale
+            d_t   = rho_i * d_prev + sq * sigma * eps
+            deltas.append(d_t)
+            d_prev = d_t.detach()
+        return torch.stack(deltas, dim=1)   # (B, T_future, 4)
+
+    def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10,
+                 times_future=None):
+        return torch.stack([
+            self.forward(z_prefix_last, T_K, x0, log_t_suffix, T_future=T_future,
+                         times_future=times_future)
+            for _ in range(n_samples)
+        ], dim=0)   # (S, B, T_future, 4)
+
+
+def _fit_ar1_targets(
+    x_true,
+    x_hat,
+    prefix_len: int,
+    feat_indices=None,
+    device_center: bool = True,
+    times_future=None,
+    log10_t_ref: float = 0.35,
+):
+    """Compute per-device AR(1) rho and sigma targets.
+
+    Args:
+        device_center: Remove per-device mean from residuals before computing
+            autocorrelation.  This isolates the within-device temporal dynamics
+            from slow systematic drift, which is already captured by the physics
+            backbone.  Strongly recommended for log-time generators.
+        times_future: (B, T_future) actual times [h] for future steps.  When
+            provided, computes log-time consistent rho_ref by fitting:
+                log(rho_ref) = mean_i [log(corr_i) * log10_t_ref / delta_log10t_i]
+            If None, uses the standard index-based estimate.
+        log10_t_ref: reference log10(1+t) step for the OU parameterisation.
+    """
+    x_true = torch.nan_to_num(x_true, nan=0.0, posinf=0.0, neginf=0.0)
+    x_hat  = torch.nan_to_num(x_hat,  nan=0.0, posinf=0.0, neginf=0.0)
+
+    resid = x_true[:, prefix_len:, :] - x_hat[:, prefix_len:, :]
+    if feat_indices is not None:
+        resid = resid[:, :, feat_indices]
+    if resid.shape[1] <= 1:
+        B, _, Fdim = resid.shape
+        return (torch.zeros(B, Fdim, device=resid.device),
+                torch.ones(B, Fdim,  device=resid.device) * 1e-3)
+
+    # ── Device-centering: remove per-device mean ─────────────────────────────
+    # Eliminates slow systematic drift (already captured by physics backbone)
+    # so ACF estimates reflect the within-device stochastic dynamics only.
+    if device_center:
+        resid = resid - resid.mean(dim=1, keepdim=True)
+
+    # ── Standard per-device autocorrelation estimate ─────────────────────────
+    r_prev = resid[:, :-1, :]   # (B, T-1, F)
+    r_curr = resid[:, 1:,  :]   # (B, T-1, F)
+    mu_prev = r_prev.mean(dim=1, keepdim=True)
+    mu_curr = r_curr.mean(dim=1, keepdim=True)
+    cov      = ((r_prev - mu_prev) * (r_curr - mu_curr)).mean(dim=1)  # (B, F)
+    var_prev = ((r_prev - mu_prev) ** 2).mean(dim=1).clamp(min=1e-6)  # (B, F)
+    rho_idx  = (cov / var_prev).clamp(1e-6, 0.97)   # positive; clamp to valid range
+
+    # ── Log-time consistent rho_ref (if times provided) ─────────────────────
+    if times_future is not None:
+        # For each step i, get delta_log10(1+t_i)
+        t = times_future.clamp(min=0.0).to(resid.device)  # (B, T_future)
+        T_f = t.shape[1]
+        if T_f > 1:
+            log1pt = torch.log10(1.0 + t)              # (B, T_future)
+            d_log  = (log1pt[:, 1:] - log1pt[:, :-1]).clamp(min=0.01, max=2.0)  # (B, T_f-1)
+
+            # Per-step correlation estimate
+            corr_step = (cov / var_prev).clamp(1e-6, 0.97)   # same as rho_idx (B, F)
+
+            # Log-time rho_ref: average of log(rho_idx) / d_log * log10_t_ref
+            # (using the batch-average d_log since rho_idx is already batch-aggregated)
+            mean_d_log = d_log.mean()   # scalar; batch + time average
+            log_rho_ref = torch.log(corr_step.clamp(min=1e-6)) * (log10_t_ref / mean_d_log)
+            rho_logtime = torch.exp(log_rho_ref).clamp(1e-6, 0.97)  # (B, F)
+            rho_target = rho_logtime
+        else:
+            rho_target = rho_idx
+    else:
+        rho_target = rho_idx
+
+    sigma_target = resid.std(dim=1).clamp(min=1e-4)   # (B, F)
+    return rho_target, sigma_target
+
+
+def _whitened_innovation_diagnostics(deltas_s, rho_pred, sigma_pred, future_mask):
+    """Compute whitened innovation statistics for one sample trajectory.
+
+    innovation = (d_t - rho * d_{t-1}) / (sigma * sqrt(1 - rho^2))
+    Should be ~ N(0,1) if the AR(1) model is correct.
+
+    Returns dict with mean, std, |kurtosis| across all valid innovations.
+    """
+    S, B, T_f, F = deltas_s.shape
+    with torch.no_grad():
+        sq    = torch.sqrt((1.0 - rho_pred ** 2).clamp(min=1e-6))  # (B, F)
+        scale = (sigma_pred * sq).unsqueeze(0).unsqueeze(2).clamp(min=1e-8)  # (1, B, 1, F)
+        innov = (deltas_s[:, :, 1:, :] - rho_pred.unsqueeze(0).unsqueeze(2) * deltas_s[:, :, :-1, :])
+        innov = innov / scale                                        # (S, B, T-1, F)
+        fm    = future_mask[:, 1:].float().unsqueeze(0).unsqueeze(-1).expand_as(innov).bool()
+        vals  = innov[fm]                                            # (N_valid,)
+    if vals.numel() == 0:
+        return {"mean": float("nan"), "std": float("nan"), "abs_kurt": float("nan")}
+    mean = float(vals.mean().item())
+    std  = float(vals.std().item())
+    kurt = float(((vals - vals.mean()) ** 4).mean().item() / max(std ** 4, 1e-8)) - 3
+    return {"mean": mean, "std": std, "abs_kurt": abs(kurt)}
+
+
+def train_stage4b(
+    model,
+    generator: AR1GuidedResidualGenerator,
+    train_dl,
+    val_dl,
+    device: torch.device,
+    mods: Optional[dict] = None,
+    n_train_samples: int = STAGE4B_N_TRAIN_SAMPLES,
+    n_val_samples: int = STAGE4B_N_VAL_SAMPLES,
+    epochs: int = STAGE4B_EPOCHS,
+    lr: float = STAGE4B_LR,
+    stable_feat_indices: Optional[list] = None,  # None = all 6 features; [0,1,2,3] = Stage 4C
+    lambda_acf: float = LAMBDA_ACF,              # ACF matching weight (0 = off)
+    patience: int = STAGE4B_PATIENCE,
+    lambda_crps: float = LAMBDA_CRPS,
+    lambda_ar1: float = LAMBDA_AR1,
+    lambda_var: float = LAMBDA_VAR,
+    lambda_pinball: float = LAMBDA_PINBALL,
+    lambda_scale: float = LAMBDA_SCALE,
+    lambda_calib: float = LAMBDA_CALIB,
+    lambda_phys_sens: float = LAMBDA_PHYS_SENS,
+    sigma_min: float = DEFAULT_SIGMA_MIN,
+    output_dir: Optional[str] = None,
+):
+    _forward = mods["train"]._forward if mods else None
+    assert _forward is not None, "mods dict with 'train' module is required"
+    if output_dir is None:
+        output_dir = cfg.CHECKPOINT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    ckpt_path = os.path.join(output_dir, "stage4b_best.pt")
+
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    generator = generator.to(device)
+    generator.train()
+
+    opt = torch.optim.AdamW(generator.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=max(1, patience // 2), factor=0.5)
+    prefix_len = cfg.STAGE3_PREFIX_LEN
+
+    log.info("Pre-caching training trajectories for Stage 4B...")
+    train_cache = _cache_trajectories(model, train_dl, device, _forward, prefix_len)
+    log.info("Pre-caching validation trajectories for Stage 4B...")
+    val_cache = _cache_trajectories(model, val_dl, device, _forward, prefix_len)
+
+    best_val_crps = float("inf")
+    best_epoch = 0
+    no_improve = 0
+    history = {"train_crps": [], "val_crps": []}
+
+    log.info("=" * 60)
+    log.info("=== Stage 4B: AR(1)-guided residual generator ===")
+    log.info("  Epochs=%d  n_train_samples=%d  lr=%.2e", epochs, n_train_samples, lr)
+    log.info("  n_val_samples=%d  sigma_min=%.4f", n_val_samples, sigma_min)
+    log.info("  Loss weights: CRPS(λ=%.2f) AR1(λ=%.2f) Var(λ=%.2f) Pin(λ=%.2f) Scale(λ=%.2f) Calib(λ=%.2f) PhysSens(λ=%.2f)",
+             lambda_crps, lambda_ar1, lambda_var, lambda_pinball, lambda_scale, lambda_calib, lambda_phys_sens)
+    log.info("=" * 60)
+
+    for epoch in range(1, epochs + 1):
+        generator.train()
+        t0 = time.time()
+        train_crps_total  = 0.0
+        train_ar1_total   = 0.0
+        train_var_total   = 0.0
+        train_pin_total   = 0.0
+        train_scale_total = 0.0
+        train_acf_total   = 0.0
+        train_calib_total = 0.0
+        train_sens_total  = 0.0
+        n_train_batches   = 0
+
+        for rec in train_cache:
+            z_pfx = rec["z_pfx"].to(device)
+            x_hat = rec["x_hat"].to(device)
+            x_true = rec["x_true"].to(device)
+            mask = rec["mask"].to(device)
+            T_K = rec["T_K"].to(device)
+            log_t = rec["log_t"].to(device)
+            x0 = rec["x0"].to(device)
+            plen = rec["plen"]
+            T_len = rec["T_len"]
+            T_future = T_len - plen
+            if T_future <= 0:
+                continue
+            # Log-time future schedule (if cached)
+            times_future_t = None
+            if "times" in rec:
+                times_future_t = rec["times"][:, plen:].to(device)   # (B, T_future)
+
+            deltas = generator.sample_n(z_pfx, T_K, x0, log_t, n_train_samples, T_future=T_future,
+                                        times_future=times_future_t)
+
+            # ── Build predictions for loss computation ───────────────────────
+            # If stable_feat_indices is set (Stage 4C), deltas covers only those
+            # features; we build predictions in that reduced feature space.
+            if stable_feat_indices is not None:
+                sfx = torch.tensor(stable_feat_indices, device=device)
+                x_hat_future = x_hat[:, plen:, :][:, :, sfx].unsqueeze(0)
+                x_pred_future = x_hat_future + deltas          # (S, B, T_f, |sfx|)
+                x_prefix_exp  = x_hat[:, :plen, :][:, :, sfx].unsqueeze(0).expand(n_train_samples, -1, -1, -1)
+                x_pred_full   = torch.cat([x_prefix_exp, x_pred_future], dim=2)
+                x_true_loss   = x_true[:, :, sfx]
+            else:
+                x_hat_future = x_hat[:, plen:, :].detach().unsqueeze(0)
+                x_pred_future = x_hat_future + deltas
+                x_prefix_exp = x_hat[:, :plen, :].detach().unsqueeze(0).expand(n_train_samples, -1, -1, -1)
+                x_pred_full = torch.cat([x_prefix_exp, x_pred_future], dim=2)
+                x_true_loss = x_true
+
+            crps = crps_mc_loss(x_pred_full, x_true_loss, mask, prefix_len=plen)
+            rho_pred, sigma_pred = generator._context_params(z_pfx, T_K, x0, log_t)
+            # Use device-centered, log-time consistent rho targets
+            rho_target, sigma_target = _fit_ar1_targets(
+                x_true, x_hat, plen,
+                feat_indices=stable_feat_indices,
+                device_center=True,
+                times_future=times_future_t,
+            )
+            rho_target = rho_target.to(device)
+            sigma_target = sigma_target.to(device)
+
+            rho_loss = ((rho_pred - rho_target) ** 2).mean()
+            sigma_loss = _temp_equalized_var_loss(sigma_pred, sigma_target, T_K)
+            future_true = torch.nan_to_num(x_true_loss[:, plen:, :], nan=0.0, posinf=0.0, neginf=0.0)
+            pinball = pinball_loss(x_pred_future, future_true, mask[:, plen:], prefix_len=0)
+            scale_reg = torch.relu(float(sigma_min) - sigma_pred).mean()
+
+            # ACF matching loss (optional, activated when lambda_acf > 0)
+            acf_l = torch.tensor(0.0, device=device)
+            if lambda_acf > 0:
+                _sfx = stable_feat_indices if stable_feat_indices is not None else list(range(x_true.shape[-1]))
+                acf_l = acf_matching_loss(
+                    deltas, x_true, x_hat, mask, plen,
+                    stable_feat_indices=_sfx,
+                )
+
+            # Coverage-calibration loss (optional, activated when lambda_calib > 0)
+            calib_l = torch.tensor(0.0, device=device)
+            if lambda_calib > 0:
+                calib_l = coverage_calibration_loss(x_pred_full, x_true_loss, mask, prefix_len=plen)
+
+            # Physics-latent sensitivity loss (optional, activated when lambda_phys_sens > 0)
+            sens_l = torch.tensor(0.0, device=device)
+            if lambda_phys_sens > 0:
+                sens_l = physics_sensitivity_loss(generator, z_pfx, T_K, x0, log_t)
+
+            loss = (
+                lambda_crps * crps
+                + lambda_ar1 * rho_loss
+                + lambda_var * sigma_loss
+                + lambda_pinball * pinball
+                + lambda_scale * scale_reg
+                + lambda_acf  * acf_l
+                + lambda_calib * calib_l
+                + lambda_phys_sens * sens_l
+            )
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
+            opt.step()
+
+            train_crps_total  += crps.item()
+            train_ar1_total   += rho_loss.item()
+            train_var_total   += sigma_loss.item()
+            train_pin_total   += pinball.item()
+            train_scale_total += scale_reg.item()
+            train_acf_total   += acf_l.item()
+            train_calib_total += calib_l.item()
+            train_sens_total  += sens_l.item()
+            n_train_batches += 1
+
+        if n_train_batches == 0:
+            log.warning("Epoch %d: no valid batches", epoch)
+            continue
+
+        train_crps_avg = train_crps_total / n_train_batches
+
+        generator.eval()
+        val_crps_total = 0.0
+        n_val_batches = 0
+        with torch.no_grad():
+            for rec in val_cache:
+                z_pfx = rec["z_pfx"].to(device)
+                x_hat = rec["x_hat"].to(device)
+                x_true = rec["x_true"].to(device)
+                mask = rec["mask"].to(device)
+                T_K = rec["T_K"].to(device)
+                log_t = rec["log_t"].to(device)
+                x0 = rec["x0"].to(device)
+                plen = rec["plen"]
+                T_len = rec["T_len"]
+                T_future = T_len - plen
+                if T_future <= 0:
+                    continue
+                times_future_v = rec["times"][:, plen:].to(device) if "times" in rec else None
+                deltas_v = generator.sample_n(z_pfx, T_K, x0, log_t, n_val_samples, T_future=T_future,
+                                              times_future=times_future_v)
+                if stable_feat_indices is not None:
+                    sfx_v = torch.tensor(stable_feat_indices, device=device)
+                    x_hat_future = x_hat[:, plen:, :][:, :, sfx_v].unsqueeze(0)
+                    x_pred_future = x_hat_future + deltas_v
+                    x_prefix_exp = x_hat[:, :plen, :][:, :, sfx_v].unsqueeze(0).expand(n_val_samples, -1, -1, -1)
+                    x_pred_v = torch.cat([x_prefix_exp, x_pred_future], dim=2)
+                    val_crps = crps_mc_loss(x_pred_v, x_true[:, :, sfx_v], mask, prefix_len=plen)
+                else:
+                    x_hat_future = x_hat[:, plen:, :].unsqueeze(0)
+                    x_pred_future = x_hat_future + deltas_v
+                    x_prefix_exp = x_hat[:, :plen, :].unsqueeze(0).expand(n_val_samples, -1, -1, -1)
+                    x_pred_v = torch.cat([x_prefix_exp, x_pred_future], dim=2)
+                    val_crps = crps_mc_loss(x_pred_v, x_true, mask, prefix_len=plen)
+                val_crps_total += val_crps.item()
+                n_val_batches += 1
+
+        val_crps_avg = val_crps_total / max(n_val_batches, 1)
+        sched.step(val_crps_avg)
+
+        # Whitened innovation diagnostics (once per epoch on first val batch)
+        innov_diag = {"mean": float("nan"), "std": float("nan"), "abs_kurt": float("nan")}
+        if val_cache:
+            _rec0 = val_cache[0]
+            with torch.no_grad():
+                _rp, _sp = generator._context_params(
+                    _rec0["z_pfx"].to(device), _rec0["T_K"].to(device),
+                    _rec0["x0"].to(device), _rec0["log_t"].to(device)
+                )
+                _tfut = _rec0["times"][:, _rec0["plen"]:].to(device) if "times" in _rec0 else None
+                _dl   = generator.sample_n(
+                    _rec0["z_pfx"].to(device), _rec0["T_K"].to(device),
+                    _rec0["x0"].to(device), _rec0["log_t"].to(device),
+                    n_samples=4, T_future=_rec0["T_len"] - _rec0["plen"],
+                    times_future=_tfut,
+                )
+                innov_diag = _whitened_innovation_diagnostics(
+                    _dl, _rp, _sp,
+                    _rec0["mask"][:, _rec0["plen"]:].to(device).bool(),
+                )
+
+        elapsed = time.time() - t0
+        log.info(
+            "Epoch %3d/%d | train_CRPS=%.4f  val_CRPS=%.4f | AR1=%.4f  Var=%.4f  ACF=%.4f  Calib=%.4f  Sens=%.4f"
+            " | innov(mu=%.3f,std=%.3f,|k|=%.2f) | %.0fs",
+            epoch, epochs, train_crps_avg, val_crps_avg,
+            train_ar1_total   / n_train_batches,
+            train_var_total   / n_train_batches,
+            train_acf_total   / n_train_batches,
+            train_calib_total / n_train_batches,
+            train_sens_total  / n_train_batches,
+            innov_diag["mean"], innov_diag["std"], innov_diag.get("abs_kurt", float("nan")),
+            elapsed,
+        )
+
+        history["train_crps"].append(train_crps_avg)
+        history["val_crps"].append(val_crps_avg)
+
+        if val_crps_avg < best_val_crps:
+            best_val_crps = val_crps_avg
+            best_epoch = epoch
+            no_improve = 0
+            torch.save({
+                "epoch": epoch,
+                "val_crps": best_val_crps,
+                "state_dict": generator.state_dict(),
+            }, ckpt_path)
+            log.info("  ✓ Saved best Stage 4B checkpoint (val_CRPS=%.4f) -> %s", best_val_crps, ckpt_path)
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                log.info("  Early stopping at epoch %d", epoch)
+                break
+
+    log.info("Stage 4B training complete. Best epoch=%d val_CRPS=%.4f", best_epoch, best_val_crps)
+    return {"best_val_crps": best_val_crps, "best_epoch": best_epoch, "history": history}
+
+
+def evaluate_stage4b(
+    model,
+    generator: AR1GuidedResidualGenerator,
+    test_dl,
+    device: torch.device,
+    mods: Optional[dict] = None,
+    n_eval_samples: int = 100,
+    prefix_len: Optional[int] = None,
+    output_dir: Optional[str] = None,
+):
+    _forward = mods["train"]._forward if mods else None
+    StochasticResidualModel = mods["stoch"].StochasticResidualModel if mods else None
+    assert _forward is not None and StochasticResidualModel is not None, "mods required"
+
+    if prefix_len is None:
+        prefix_len = cfg.STAGE3_PREFIX_LEN
+    if output_dir is None:
+        output_dir = cfg.RESULTS_DIR
+    os.makedirs(output_dir, exist_ok=True)
+
+    model.eval()
+    generator.eval()
+
+    all_x_true, all_x_mean, all_T_K, all_times, all_mask = [], [], [], [], []
+    with torch.no_grad():
+        for batch in test_dl:
+            x_raw = batch["x"].to(device)
+            T_K = batch["T_K"].to(device)
+            times = batch["times_h"].to(device)
+            mask = batch["mask"].to(device)
+            x0 = x_raw[:, 0, :]
+            B, T_len, F = x_raw.shape
+            if T_len <= prefix_len + 1:
+                continue
+            _, _, x_hat, x_true, _, _, _, _, _ = _forward(model, batch, device)
+            all_x_mean.append(x_hat.cpu().numpy())
+            all_x_true.append(x_true.cpu().numpy())
+            all_T_K.append(T_K.cpu().numpy())
+            all_times.append(times.cpu().numpy())
+            all_mask.append(mask.cpu().numpy())
+
+    if not all_x_true:
+        log.warning("No valid test batches for Stage 4B evaluation")
+        return {}
+
+    x_true_np = np.concatenate(all_x_true, axis=0)
+    x_mean_np = np.concatenate(all_x_mean, axis=0)
+    T_K_np = np.concatenate(all_T_K)
+    times_np = np.concatenate(all_times, axis=0)
+    mask_np = np.concatenate(all_mask, axis=0)
+    N, T_len, F = x_true_np.shape
+
+    eval_cache = _cache_trajectories(model, test_dl, device, _forward, prefix_len)
+    samples_4b = np.full((n_eval_samples, N, T_len, F), np.nan)
+    n_placed = 0
+    with torch.no_grad():
+        for rec in eval_cache:
+            z_pfx = rec["z_pfx"].to(device)
+            x_hat_r = rec["x_hat"].to(device)
+            T_K = rec["T_K"].to(device)
+            log_t = rec["log_t"].to(device)
+            x0 = rec["x0"].to(device)
+            plen_r = rec["plen"]
+            b_end = n_placed + x_hat_r.shape[0]
+            if b_end > N:
+                b_end = N
+            deltas = generator.sample_n(z_pfx, T_K, x0, log_t, n_eval_samples, T_future=max(0, T_len - plen_r))
+            x_hat_np = x_hat_r.cpu().numpy()
+            _stable = getattr(generator, 'STABLE_INDICES', None)
+            for s in range(n_eval_samples):
+                x_s = x_hat_np[: b_end - n_placed].copy()
+                d_s = deltas[s].cpu().numpy()[: b_end - n_placed, :, :]
+                if _stable is not None:
+                    # Stable-only generator: apply residuals to stable columns only
+                    for fi_loc, fi_glob in enumerate(_stable):
+                        x_s[:, plen_r:, fi_glob] += d_s[:, :, fi_loc]
+                else:
+                    x_s[:, plen_r:, :] += d_s
+                samples_4b[s, n_placed:b_end, :T_len, :] = x_s
+            n_placed = b_end
+            if n_placed >= N:
+                break
+
+    dummy = StochasticResidualModel()
+    metrics_4b = dummy.compute_metrics(
+        x_true_np, samples_4b, mask_np,
+        T_K=T_K_np, prefix_len=prefix_len, x_mean=x_mean_np, times_h=times_np,
+    )
+
+    # "_overall" fields average across all 6 features, but IDLeak/IGLeak are
+    # NOT generated by this model (zero-variance point copies of x_hat, see
+    # the `_stable is not None` branch above) — their coverage is 0 by
+    # construction and drags the blended average down in a way that does not
+    # reflect this generator's actual calibration. Report a stable-features
+    # -only summary alongside the raw (misleading-if-read-alone) "_overall".
+    _stable = getattr(generator, 'STABLE_INDICES', None)
+    if _stable is not None:
+        stable_names = [cfg.FEATURES[i] for i in _stable]
+        for key in ("coverage_50", "coverage_80", "coverage_90", "crps_by_feature", "crpss"):
+            per_feat = metrics_4b.get(key, {})
+            vals = [per_feat[n] for n in stable_names if n in per_feat and np.isfinite(per_feat[n])]
+            metrics_4b[f"{key}_stable_overall"] = float(np.mean(vals)) if vals else float("nan")
+
+    log.info(
+        "Stage 4B Results: CRPS=%.4f  CRPSS=%.3f  Cov90(6-feat,incl.leakage)=%.2f  "
+        "Cov90(4-feat,generated only)=%.2f  MACE=%.4f",
+        metrics_4b.get("crps_overall", float("nan")),
+        metrics_4b.get("crpss_overall", float("nan")),
+        metrics_4b.get("coverage_90_overall", float("nan")),
+        metrics_4b.get("coverage_90_stable_overall", float("nan")),
+        metrics_4b.get("reliability_mace", float("nan")),
+    )
+
+    out_path = os.path.join(output_dir, "evaluation_results_stage4b.pkl")
+    with open(out_path, "wb") as fh:
+        pickle.dump({"stage4b_metrics": metrics_4b, "n_eval_samples": n_eval_samples}, fh)
+    log.info("Stage 4B evaluation saved → %s", out_path)
+    return {"stage4b_metrics": metrics_4b}
+
+
+def build_smoke_test_dataset(n_devices: int = 2, seq_len: int = 8):
+    x = np.linspace(0.0, 1.0, seq_len, endpoint=True).astype(np.float32)
+    x = np.stack([x, 0.5 + 0.1 * np.arange(seq_len), 0.2 + 0.05 * np.arange(seq_len), np.linspace(0.8, 0.4, seq_len), np.linspace(0.1, 0.2, seq_len), np.linspace(0.05, 0.1, seq_len)], axis=1)
+    x = np.repeat(x[None, :, :], n_devices, axis=0)
+    x = np.tile(x, (1, 1, 1))
+    x = x + np.array([0.0, 0.01, -0.01, 0.0, 0.0, 0.0])[None, None, :]
+
+    feature_mask = np.ones((n_devices, seq_len, cfg.FEATURE_DIM), dtype=bool)
+    mask = np.ones((n_devices, seq_len), dtype=bool)
+    times_h = np.array([np.array([0, 1, 2, 5, 10, 20, 50, 100][:seq_len], dtype=np.float32) for _ in range(n_devices)], dtype=np.float32)
+    T_K = np.full((n_devices,), 573.15 + 25.0, dtype=np.float32)
+    x0_static = np.tile(np.array([0.1, 0.2, 0.3, 0.4, 0.05, 0.02], dtype=np.float32), (n_devices, 1))
+
+    dataset = {
+        "x": x.astype(np.float32),
+        "feature_mask": feature_mask.astype(bool),
+        "mask": mask.astype(bool),
+        "times_h": times_h.astype(np.float32),
+        "T_K": T_K.astype(np.float32),
+        "x0_normalized": x0_static.astype(np.float32),
+        "device_ids": [f"smoke_{i}" for i in range(n_devices)],
+        "split": {"train": [0], "val": [1], "test": [1]},
+        "leakage_floor": {"IDLeak": 1e-9, "IGLeak": 1e-9},
+    }
+    return dataset
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="Stage 4B AR(1)-guided residual generator")
+    p.add_argument("--epochs", type=int, default=STAGE4B_EPOCHS)
+    p.add_argument("--n-train-samples", type=int, default=STAGE4B_N_TRAIN_SAMPLES)
+    p.add_argument("--n-val-samples", type=int, default=STAGE4B_N_VAL_SAMPLES)
+    p.add_argument("--n-eval-samples", type=int, default=100)
+    p.add_argument("--lr", type=float, default=STAGE4B_LR)
+    p.add_argument("--hidden-dim", type=int, default=STAGE4B_HIDDEN_DIM)
+    p.add_argument("--noise-dim", type=int, default=STAGE4B_NOISE_DIM)
+    p.add_argument("--lambda-crps", type=float, default=LAMBDA_CRPS)
+    p.add_argument("--lambda-ar1", type=float, default=LAMBDA_AR1)
+    p.add_argument("--lambda-var", type=float, default=LAMBDA_VAR)
+    p.add_argument("--lambda-pinball", type=float, default=LAMBDA_PINBALL)
+    p.add_argument("--lambda-scale", type=float, default=LAMBDA_SCALE)
+    p.add_argument("--lambda-calib", type=float, default=LAMBDA_CALIB,
+        help="Weight for direct coverage-calibration loss (0=off). Targets "
+             "50/80/90%% empirical coverage matching nominal levels.")
+    p.add_argument("--lambda-phys-sens", type=float, default=LAMBDA_PHYS_SENS,
+        help="Weight for physics-latent sensitivity loss (0=off). Penalises "
+             "the generator for predicting (rho,sigma) insensitive to z_phys.")
+    p.add_argument("--sigma-min", type=float, default=DEFAULT_SIGMA_MIN)
+    p.add_argument("--log-scale-floor-init", type=float, default=DEFAULT_LOG_SCALE_FLOOR_INIT)
+    p.add_argument("--stage3-ckpt", type=str, default=None)
+    p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--skip-train", action="store_true")
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--smoke-test", action="store_true", help="Run a lightweight smoke test without the full dataset")
+    p.add_argument("--stable-only", action="store_true",
+        help="Stage 4C mode: train AR1GuidedResidualGeneratorStable on stable features only.")
+    p.add_argument("--lambda-acf", type=float, default=LAMBDA_ACF,
+        help="Weight for ACF matching loss (0=off). Use e.g. 0.10 for Stage 4C-ACF variant.")
+    return p.parse_args()
+
+
+def main():
+    args = _parse_args()
+    device = torch.device(args.device)
+    set_global_seed(args.seed)
+    log.info("Using random seed: %d", args.seed)
+
+    if args.smoke_test:
+        dataset = build_smoke_test_dataset()
+        out_path = os.path.join(args.output_dir or cfg.OUTPUT_PATH, "smoke_test_dataset.pkl")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as fh:
+            pickle.dump(dataset, fh)
+        log.info("Smoke-test dataset written to %s", out_path)
+
+        generator = AR1GuidedResidualGenerator().to(device)
+        dummy = torch.randn(2, cfg.STAGE3_PREFIX_LEN, cfg.FEATURE_DIM, device=device)
+        with torch.no_grad():
+            sample = generator.sample_n(
+                torch.randn(2, cfg.LATENT_DIM, device=device),
+                torch.tensor([573.15 + 25.0, 573.15 + 25.0], device=device),
+                dummy,
+                torch.ones(2, cfg.STAGE3_PREFIX_LEN, device=device),
+                n_samples=2,
+                T_future=4,
+            )
+        metrics = {"smoke_sample_shape": list(sample.shape), "smoke_ok": True}
+        metrics_path = os.path.join(os.path.dirname(out_path), "stage4b_smoke_metrics.pkl")
+        with open(metrics_path, "wb") as fh:
+            pickle.dump(metrics, fh)
+        log.info("Smoke-test metrics written to %s", metrics_path)
+        return
+
+    output_dir = args.output_dir or cfg.OUTPUT_PATH
+    ckpt_dir = os.path.join(output_dir, "checkpoints")
+    results_dir = os.path.join(output_dir, "results")
+
+    log.info("Loading pipeline modules for Stage 4B...")
+    mods = _load_all()
+    train_mod = mods["train"]
+
+    log.info("Loading dataset...")
+    prep_path = cfg.PROCESSED_DATA_PATH
+    if not os.path.exists(prep_path):
+        log.warning("Processed dataset not found at %s; falling back to synthetic smoke-test dataset", prep_path)
+        dataset = build_smoke_test_dataset()
+        out_path = os.path.join(output_dir, "smoke_test_dataset.pkl")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as fh:
+            pickle.dump(dataset, fh)
+        log.info("Wrote fallback dataset to %s", out_path)
+    else:
+        with open(prep_path, "rb") as fh:
+            dataset = pickle.load(fh)
+
+    from torch.utils.data import DataLoader
+    split = dataset["split"]
+    all_idx = list(range(len(dataset["device_ids"])))
+    train_idx = split.get("train", all_idx[: int(0.7 * len(all_idx))])
+    val_idx = split.get("val", all_idx[int(0.7 * len(all_idx)) :])
+    test_idx = split.get("test", val_idx)
+
+    train_ds = train_mod.DeviceDegradationDataset(dataset, train_idx)
+    val_ds = train_mod.DeviceDegradationDataset(dataset, val_idx)
+    test_ds = train_mod.DeviceDegradationDataset(dataset, test_idx)
+    train_dl = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=train_mod.collate_fn)
+    val_dl = DataLoader(val_ds, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=train_mod.collate_fn)
+    test_dl = DataLoader(test_ds, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=train_mod.collate_fn)
+
+    log.info("Building PI-TimeGAN backbone...")
+    model = _build_model(mods).to(device)
+
+    stage3_ckpt = args.stage3_ckpt or os.path.join(ckpt_dir, "stage3_best.pt")
+    if not os.path.exists(stage3_ckpt):
+        log.warning("Stage 3 checkpoint not found at %s; using a randomly initialized backbone for smoke execution", stage3_ckpt)
+        model = model.eval()
+    else:
+        ckpt = torch.load(stage3_ckpt, map_location=device)
+        model_state = ckpt.get("model_state", ckpt.get("model_state_dict", None))
+        if model_state is None:
+            log.error("Checkpoint %s has no model_state", stage3_ckpt)
+            sys.exit(1)
+        model_state_clean = {k: v for k, v in model_state.items() if k != "decoder.mask"}
+        model.load_state_dict(model_state_clean, strict=False)
+        log.info("Loaded Stage 3 checkpoint: %s", stage3_ckpt)
+
+    is_stable = getattr(args, "stable_only", False)
+    if is_stable:
+        log.info("Stage 4C mode: generating only stable features %s", STABLE_FEAT_INDICES)
+        generator = AR1GuidedResidualGeneratorStable(
+            noise_dim=args.noise_dim,
+            hidden_dim=args.hidden_dim,
+            log_scale_floor_init=args.log_scale_floor_init,
+        ).to(device)
+        stable_fi  = STABLE_FEAT_INDICES
+    else:
+        generator = AR1GuidedResidualGenerator(
+            noise_dim=args.noise_dim,
+            hidden_dim=args.hidden_dim,
+            log_scale_floor_init=args.log_scale_floor_init,
+        ).to(device)
+        stable_fi  = None
+    # train_stage4b always saves to "stage4b_best.pt"; use that as the canonical name
+    ckpt_label = "stage4b_best.pt"
+
+    stage4b_ckpt = os.path.join(ckpt_dir, ckpt_label)
+    if args.skip_train and os.path.exists(stage4b_ckpt):
+        ckpt4b = torch.load(stage4b_ckpt, map_location=device)
+        generator.load_state_dict(ckpt4b["state_dict"])
+        log.info("Loaded existing checkpoint: %s", stage4b_ckpt)
+    else:
+        train_stage4b(
+            model, generator, train_dl, val_dl, device,
+            mods=mods,
+            n_train_samples=args.n_train_samples,
+            n_val_samples=args.n_val_samples,
+            epochs=args.epochs,
+            lr=args.lr,
+            lambda_crps=args.lambda_crps,
+            lambda_ar1=args.lambda_ar1,
+            lambda_var=args.lambda_var,
+            lambda_pinball=args.lambda_pinball,
+            lambda_scale=args.lambda_scale,
+            lambda_acf=getattr(args, 'lambda_acf', LAMBDA_ACF),
+            lambda_calib=getattr(args, 'lambda_calib', LAMBDA_CALIB),
+            lambda_phys_sens=getattr(args, 'lambda_phys_sens', LAMBDA_PHYS_SENS),
+            sigma_min=args.sigma_min,
+            output_dir=ckpt_dir,
+            stable_feat_indices=stable_fi,
+        )
+        ckpt4b = torch.load(stage4b_ckpt, map_location=device)
+        generator.load_state_dict(ckpt4b["state_dict"])
+
+    evaluate_stage4b(
+        model, generator, test_dl, device,
+        mods=mods,
+        n_eval_samples=args.n_eval_samples,
+        output_dir=results_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
