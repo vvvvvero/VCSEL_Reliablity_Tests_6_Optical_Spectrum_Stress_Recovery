@@ -66,6 +66,11 @@ PATIENCE           = 6
 CRPS_TOL           = 0.05    # max allowed fractional CRPS degradation vs Stage 4B
 DIVERSITY_FLOOR    = 0.70    # min generated diversity as fraction of Stage 4B baseline
 DISC_ACC_CEIL      = 0.85    # max discriminator balanced-accuracy before "mode collapse" flag
+# Min allowed absolute Cov90 as a fraction of the Stage 4B baseline's own
+# Cov90 (added 2026-08-21: diversity_floor's sample-std ratio missed a real
+# collapse where sigma shrank ~40% and Cov90 dropped 0.92->0.75 despite
+# passing the diversity check — this guard tracks calibration directly).
+COV90_FLOOR        = 0.90
 
 
 # ─── Module loader ────────────────────────────────────────────────────────────
@@ -144,6 +149,36 @@ def _diversity(deltas: torch.Tensor) -> float:
     return float(deltas.std(dim=0).mean().item())
 
 
+def _coverage90_counts(x_pred_full: "torch.Tensor", x_true: "torch.Tensor",
+                        mask: "torch.Tensor", prefix_len: int):
+    """Count how many (device, future-timestep, feature) triples have the
+    true value inside the [5th, 95th] percentile band of the S generated
+    samples, plus the total number of valid triples checked. Returns
+    (hits, total) as plain ints so callers can accumulate across batches
+    before dividing (avoids batch-size-weighting bias from averaging
+    per-batch ratios).
+
+    Used to give the Stage 5 collapse guard a DIRECT calibration signal —
+    the pre-existing diversity_floor (sample std relative to the Stage 4B
+    baseline) did not catch a real case where sigma shrank ~40% across all
+    stable features (still above the 0.70 ratio floor) while true Cov90
+    dropped from 0.92 to 0.75 on a full evaluation (2026-08-21).
+    """
+    S, B, T, F = x_pred_full.shape
+    future_mask = mask.clone()
+    future_mask[:, :prefix_len] = 0
+    valid = (future_mask > 0).unsqueeze(-1) & ~torch.isnan(x_true)   # (B, T, F)
+    if valid.sum() == 0:
+        return 0, 0
+    lo = torch.quantile(x_pred_full, 0.05, dim=0)   # (B, T, F)
+    hi = torch.quantile(x_pred_full, 0.95, dim=0)   # (B, T, F)
+    x_true_c = torch.nan_to_num(x_true, nan=0.0)
+    inside = (x_true_c >= lo) & (x_true_c <= hi)
+    hits = int((inside & valid).sum().item())
+    total = int(valid.sum().item())
+    return hits, total
+
+
 def physics_preserve_loss(deltas: torch.Tensor, mask: "torch.Tensor" = None) -> torch.Tensor:
     """L_phys-preserve = || (1/M) sum_m x_fake^(m) - mu_phys ||^2.
 
@@ -183,6 +218,7 @@ def train_stage5(
     stage4b_val_crps: float,
     stage4b_diversity: float,
     output_dir: str,
+    stage4b_cov90:   float = None,
     epochs:          int   = STAGE5_EPOCHS,
     lr_g:            float = STAGE5_LR_G,
     lr_d:            float = STAGE5_LR_D,
@@ -197,6 +233,7 @@ def train_stage5(
     crps_tol:        float = CRPS_TOL,
     diversity_floor: float = DIVERSITY_FLOOR,
     disc_acc_ceil:   float = DISC_ACC_CEIL,
+    cov90_floor:     float = COV90_FLOOR,
 ):
     # Import Stage 4B loss helpers
     s4b_mod = sys.modules.get("_s5_stage4b")
@@ -459,6 +496,7 @@ def train_stage5(
         disc.eval()
         val_crps_sum = 0.0
         n_val = 0
+        cov90_hits, cov90_total = 0, 0
         with torch.no_grad():
             for rec in val_cache:
                 z_pfx   = rec["z_pfx"].to(device)
@@ -478,15 +516,20 @@ def train_stage5(
                     x_pf  = x_hat[:, plen:, :][:, :, sfx_v].unsqueeze(0) + deltas_v
                     xpfx  = x_hat[:, :plen, :][:, :, sfx_v].unsqueeze(0).expand(n_val_samples, -1, -1, -1)
                     x_pv  = torch.cat([xpfx, x_pf], dim=2)
-                    val_crps_sum += crps_mc_loss(x_pv, x_true[:, :, sfx_v], mask, prefix_len=plen).item()
+                    xt    = x_true[:, :, sfx_v]
                 else:
                     x_pf = x_hat[:, plen:, :].unsqueeze(0) + deltas_v
                     xpfx = x_hat[:, :plen, :].unsqueeze(0).expand(n_val_samples, -1, -1, -1)
                     x_pv = torch.cat([xpfx, x_pf], dim=2)
-                    val_crps_sum += crps_mc_loss(x_pv, x_true, mask, prefix_len=plen).item()
+                    xt   = x_true
+                val_crps_sum += crps_mc_loss(x_pv, xt, mask, prefix_len=plen).item()
+                hits, tot = _coverage90_counts(x_pv, xt, mask, plen)
+                cov90_hits += hits
+                cov90_total += tot
                 n_val += 1
 
         val_crps = val_crps_sum / max(n_val, 1)
+        val_cov90 = cov90_hits / max(cov90_total, 1)
         sched_g.step(val_crps)
         elapsed = time.time() - t0
 
@@ -554,11 +597,13 @@ def train_stage5(
         avg_disc_acc  = disc_acc_sum  / n_batches
         crps_degraded = (val_crps - stage4b_val_crps) / max(abs(stage4b_val_crps), 1e-8)
         div_ratio     = avg_diversity / max(stage4b_diversity, 1e-8)
+        cov90_ratio   = (val_cov90 / max(stage4b_cov90, 1e-8)) if stage4b_cov90 is not None else float("nan")
 
         guard_pass = (
             crps_degraded <= crps_tol and
             div_ratio      >= diversity_floor and
-            avg_disc_acc   <= disc_acc_ceil
+            avg_disc_acc   <= disc_acc_ceil and
+            (stage4b_cov90 is None or cov90_ratio >= cov90_floor)
         )
         if not guard_pass:
             collapse_count += 1
@@ -567,10 +612,11 @@ def train_stage5(
 
         log.info(
             "Epoch %3d/%d | val_CRPS=%.4f (S4B=%.4f) | G_CRPS=%.4f G_adv=%.4f G_phys=%.5f "
-            "| disc_acc=%.3f div_ratio=%.2f | r_meas=%.4g lam_adv=%.6f | guards=%s | %.0fs",
+            "| disc_acc=%.3f div_ratio=%.2f Cov90=%.3f(S4B=%.3f,ratio=%.2f) | r_meas=%.4g lam_adv=%.6f | guards=%s | %.0fs",
             epoch, epochs, val_crps, stage4b_val_crps,
             g_crps_sum / n_batches, g_adv_sum / n_batches, g_phys_sum / n_batches,
-            avg_disc_acc, div_ratio, r_meas_epoch, _lambda_adv,
+            avg_disc_acc, div_ratio, val_cov90, stage4b_cov90 if stage4b_cov90 is not None else float("nan"), cov90_ratio,
+            r_meas_epoch, _lambda_adv,
             "PASS" if guard_pass else f"FAIL({collapse_count})",
             elapsed,
         )
@@ -626,6 +672,10 @@ def main():
     ap.add_argument("--crps-tol",      type=float, default=CRPS_TOL)
     ap.add_argument("--diversity-floor",type=float,default=DIVERSITY_FLOOR)
     ap.add_argument("--disc-acc-ceil", type=float, default=DISC_ACC_CEIL)
+    ap.add_argument("--cov90-floor",   type=float, default=COV90_FLOOR,
+        help="Min allowed Cov90 as a fraction of the Stage 4B baseline's own "
+             "Cov90 (0=effectively off). Catches sigma-shrink collapse that "
+             "diversity_floor's relative-std ratio can miss.")
     ap.add_argument("--device",        default="cpu")
     ap.add_argument("--seed",          type=int,   default=42)
     args = ap.parse_args()
@@ -721,12 +771,19 @@ def main():
     log.info("Caching validation trajectories...")
     val_cache   = _cache_trajectories(model3, val_dl,   device, _forward, cfg.STAGE3_PREFIX_LEN)
 
-    # Compute Stage 4B baseline val_CRPS and diversity for collapse guard
+    # Compute Stage 4B baseline val_CRPS, diversity, and Cov90 for collapse guard.
+    # Cov90 added 2026-08-21: diversity_floor alone (a ratio vs baseline
+    # std) did not catch a real collapse case where Stage 5 shrank sigma by
+    # ~40% across all 4 stable features (still above the 0.70 floor) while
+    # Cov90 on a full-sample eval dropped from 0.92 to 0.75 — the guard
+    # needs a metric that tracks calibration quality directly, not just
+    # relative sample spread.
     log.info("Computing Stage 4B baseline metrics for collapse guard...")
     crps_mc_loss_fn = mods["_s5_stage4b"].crps_mc_loss
     s4b_crps_sum = 0.0
     s4b_div_sum  = 0.0
     n_val = 0
+    cov90_hits, cov90_total = 0, 0
     gen4b.eval()
     with torch.no_grad():
         for rec in val_cache:
@@ -747,19 +804,24 @@ def main():
                 x_f  = x_hat[:, plen:, :][:, :, _sfx].unsqueeze(0) + deltas
                 xpfx = x_hat[:, :plen, :][:, :, _sfx].unsqueeze(0).expand(N_VAL_SAMPLES, -1, -1, -1)
                 xpv  = torch.cat([xpfx, x_f], dim=2)
-                s4b_crps_sum += crps_mc_loss_fn(xpv, x_true[:, :, _sfx], mask, prefix_len=plen).item()
+                xt   = x_true[:, :, _sfx]
             else:
                 x_f  = x_hat[:, plen:, :].unsqueeze(0) + deltas
                 xpfx = x_hat[:, :plen, :].unsqueeze(0).expand(N_VAL_SAMPLES, -1, -1, -1)
                 xpv  = torch.cat([xpfx, x_f], dim=2)
-                s4b_crps_sum += crps_mc_loss_fn(xpv, x_true, mask, prefix_len=plen).item()
+                xt   = x_true
+            s4b_crps_sum += crps_mc_loss_fn(xpv, xt, mask, prefix_len=plen).item()
+            hits, tot = _coverage90_counts(xpv, xt, mask, plen)
+            cov90_hits += hits
+            cov90_total += tot
             s4b_div_sum  += _diversity(deltas)
             n_val += 1
 
     stage4b_val_crps  = s4b_crps_sum  / max(n_val, 1)
     stage4b_diversity = s4b_div_sum   / max(n_val, 1)
-    log.info("Stage 4B baseline: val_CRPS=%.4f  diversity=%.4f",
-             stage4b_val_crps, stage4b_diversity)
+    stage4b_cov90     = cov90_hits / max(cov90_total, 1)
+    log.info("Stage 4B baseline: val_CRPS=%.4f  diversity=%.4f  Cov90=%.4f",
+             stage4b_val_crps, stage4b_diversity, stage4b_cov90)
 
     # Train Stage 5
     result = train_stage5(
@@ -770,6 +832,7 @@ def main():
         device=device,
         stage4b_val_crps=stage4b_val_crps,
         stage4b_diversity=stage4b_diversity,
+        stage4b_cov90=stage4b_cov90,
         output_dir=args.output_dir,
         epochs=args.epochs,
         lr_g=args.lr_g,
@@ -782,6 +845,7 @@ def main():
         crps_tol=args.crps_tol,
         diversity_floor=args.diversity_floor,
         disc_acc_ceil=args.disc_acc_ceil,
+        cov90_floor=args.cov90_floor,
     )
 
     log.info("Stage 5 complete: %s", result)
