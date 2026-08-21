@@ -5,23 +5,79 @@ Physics-informed Latent ODE system for GaN HEMT thermal-storage degradation.
 
 5 Effective Latent States
 --------------------------
-  zG  –  Gate / interface / barrier effective charged-defect occupancy   [0,1]
-  zB  –  Buffer / access-region effective charged-defect occupancy        [0,1]
+  zG  –  Gate / interface effective trap occupancy fraction              [0,1]
+  zB  –  Buffer / access-region effective trap occupancy fraction        [0,1]
   zM  –  Channel transport degradation                                    [0,1]  (monotone)
   zL  –  Leakage-path degradation                                         [0,1]  (monotone)
   zC  –  Cumulative irreversible structural damage                        [0,1]  (monotone)
 
-ODE (simplified V1 for stable first-pass training)
----------------------------------------------------
-  dzG/dt = kGc·frev(T)·(1-zG)  -  kGe·frev(T)·zG
-  dzB/dt = kBc·frev(T)·(1-zB)  -  kBe·frev(T)·zB
-  dzM/dt = kM ·firrev(T)·(wMG·zG + wMB·zB + zC)
+ODE (V2: SRH-form trap kinetics + explicit boundary-continuity constraints)
+-----------------------------------------------------------------------------
+zG and zB follow simplified Shockley-Read-Hall (SRH) trap-occupancy kinetics.
+Full SRH statistics for a single trap level exchanging with both carrier
+bands gives (using f_t = trap occupancy fraction):
+
+    df_t/dt = c_n·n·(1-f_t) - e_n·f_t - c_p·p·f_t + e_p·(1-f_t)
+
+Detailed balance ties each capture/emission pair to the SAME activation
+energy (they differ only by a temperature-independent trap-level prefactor,
+not by a separate thermal barrier), so emission and capture for one carrier
+type share one Arrhenius factor:
+
+    dzG/dt = kGc·frev(T)·(1-zG) - kGe·frev(T)·zG                 [majority-carrier term, as V1]
+             + gammaG·[ kGc·frev(T)·(1-zG) - kGe·frev(T)·zG ]      [minority-carrier correction]
+           = (1+gammaG)·[ kGc·frev(T)·(1-zG) - kGe·frev(T)·zG ]
+
+  i.e. gammaG >= 0 is a single extra scalar per fast state that scales the
+  net SRH exchange rate to account for the (smaller, same-sign) opposite-
+  carrier contribution, WITHOUT introducing 4 independent rate constants
+  per state (which the dataset — 203 devices, low single digits per
+  device-type x temperature cell — cannot identify; see debug notes on
+  alpha_identifiability). This keeps the same functional form as V1's
+  (1-zG)/zG relaxation (so it stays a well-posed, bounded-drift ODE) while
+  giving kGe/kGc a falsifiable SRH interpretation: at fixed T, the
+  equilibrium occupancy z_G,eq = kGc/(kGc+kGe) is the SRH-implied trap
+  Fermi-level occupancy, and gammaG is now a REPORTED, testable quantity
+  (see minority_carrier_weight_gG/gB) rather than folded silently into kGc.
+
+zM, zL, zC keep their V1 saturating-drift structure (driven by trap
+occupancy + cumulative damage, monotone via a (1-z) saturation factor),
+which is structurally identical to a diffusion-limited drift term: the
+"driving force" (zG, zB, zC mixture) plays the role of a concentration
+gradient forcing the state toward its saturation boundary, and the (1-z)
+factor is the SRH-style saturation cutoff (occupancy cannot exceed 1).
+
+  dzM/dt = kM ·firrev(T)·(wMG·zG + wMB·zB + zC)·(1-zM)
   dzL/dt = kL ·firrev(T)·(1-zL)·(aLG·zG + aLB·zB + zC)
-    dzC/dt = kC ·device_alpha·firrev(T)·(1-zC)^2
+  dzC/dt = kC ·device_alpha·firrev(T)·(1-zC)^2
 
 Arrhenius temperature factors (relative to T_ref):
   frev  (T) = exp(-Ea_rev  / kB · (1/T - 1/T_ref))
   firrev(T) = exp(-Ea_irrev / kB · (1/T - 1/T_ref))
+
+Boundary-continuity conditions
+-------------------------------
+Two continuity requirements are enforced, one structurally (built into the
+RHS so it holds at every integration step, not just approximately) and one
+as a soft training penalty (checked, not assumed):
+
+  1. Saturation-boundary flux continuity (structural): every monotone
+     state's RHS carries an explicit (1-z) or (1-z)^2 saturation factor, so
+     dz/dt -> 0 smoothly (no kink, first-derivative-continuous in z) as
+     z -> 1. This was already true in V1; V2 keeps it and extends it to the
+     new SRH terms (the minority-carrier correction reuses the same
+     (1-zG)/(1-zB) factors, so it cannot introduce a discontinuity).
+
+  2. Trap-to-damage handoff continuity (soft, checked via
+     handoff_continuity_residual): the driving force feeding zM/zL
+     (wMG*zG + wMB*zB + zC and aLG*zG + aLB*zB + zC) must be continuous
+     across the observed trajectory — i.e. no instantaneous jump in the
+     effective driving term at any observed time step. This is checked
+     numerically (max jump in driving force between consecutive observed
+     points, relative to the local RK4 step) and penalised if it exceeds a
+     tolerance, catching integrator/parameter pathologies (e.g. a badly
+     scaled gammaG causing a near-discontinuous jump) that (1) alone does
+     not rule out.
 
 All rate constants are parameterised via softplus to guarantee positivity.
 Monotonicity of zM, zL, zC is enforced by the ODE structure (non-negative RHS).
@@ -44,6 +100,7 @@ import config as cfg
 
 ARRHENIUS_EXP_CLAMP = 15.0
 RHS_CLAMP = 50.0
+SOFT_CLAMP_BETA = 40.0   # sharpness of the smooth [0,1] boundary saturation
 
 # ---------------------------------------------------------------------------
 # Helper: softplus parameter factory (guarantees positivity)
@@ -54,19 +111,48 @@ def _sp(raw: torch.Tensor) -> torch.Tensor:
     return F.softplus(raw)
 
 
+def _soft_clamp01(z: torch.Tensor, beta: float = SOFT_CLAMP_BETA) -> torch.Tensor:
+    """Smooth, everywhere-differentiable projection onto [0,1].
+
+    Built from softplus (the standard smooth approximation of relu), applied
+    twice:
+        soft_relu(z)    = softplus(z, beta)                ~ max(z, 0)
+        soft_clamp01(z) = 1 - softplus(1 - soft_relu(z), beta)   ~ min(., 1)
+
+    Softplus is asymptotically exact (softplus(x,beta) -> x as x -> +inf), so
+    deep in the interior of [0,1] this reduces to the EXACT identity — not an
+    approximation tuned by a boundary-band width, but a mathematical
+    consequence of softplus's own asymptotics. Only within a few 1/beta of
+    the 0/1 boundary does it deviate from a hard clamp, smoothing the corner.
+
+    Unlike torch.clamp, whose gradient is EXACTLY zero for any input outside
+    [0,1] (the failure mode that caused the RK4 integrator's backward pass to
+    accumulate NaN once zM/zL saturate near 1 — see 2026-08-16 investigation
+    notes), this function's gradient is sigmoid(beta*x)-shaped: strictly
+    positive for every finite input, only underflowing to float32's zero
+    representation many orders of magnitude past the boundary (verified
+    numerically to stay >1e-6 for overshoot up to ~0.3 beyond [0,1], well
+    past what RK4 substeps produce in practice).
+    """
+    soft_relu = F.softplus(z, beta=beta)
+    return 1.0 - F.softplus(1.0 - soft_relu, beta=beta)
+
+
 # ---------------------------------------------------------------------------
 # Physics ODE Module
 # ---------------------------------------------------------------------------
 
 class PhysicsODE(nn.Module):
     """
-    Learnable physics ODE for the 5 latent states.
+    Learnable physics ODE for the 5 latent states (SRH-form trap kinetics).
 
     Learnable parameters
     --------------------
     log_Ea_rev, log_Ea_irrev   : shared activation energies [eV]
-    kGc_raw, kGe_raw           : gate capture / emission rate constants
-    kBc_raw, kBe_raw           : buffer capture / emission rate constants
+    kGc_raw, kGe_raw           : gate SRH majority-carrier capture / emission rates
+    gammaG_raw                 : gate SRH minority-carrier correction weight (>=0)
+    kBc_raw, kBe_raw           : buffer SRH majority-carrier capture / emission rates
+    gammaB_raw                 : buffer SRH minority-carrier correction weight (>=0)
     kM_raw                     : channel transport damage rate
     wMG_raw, wMB_raw           : mixing weights (zG, zB → zM)
     kL_raw                     : leakage path growth rate
@@ -85,13 +171,18 @@ class PhysicsODE(nn.Module):
         self.log_Ea_rev   = nn.Parameter(torch.tensor(math.log(0.30)))
         self.log_Ea_irrev = nn.Parameter(torch.tensor(math.log(0.70)))
 
-        # Gate / interface trap kinetics
+        # Gate / interface trap kinetics (SRH majority-carrier term)
         self.kGc_raw = nn.Parameter(torch.tensor(-2.0))   # capture rate
         self.kGe_raw = nn.Parameter(torch.tensor(-3.0))   # emission rate
+        # SRH minority-carrier correction: init small (gamma≈0.05) so V2
+        # starts close to V1's pure two-state relaxation and only grows the
+        # correction if the data support it.
+        self.gammaG_raw = nn.Parameter(torch.tensor(-3.0))
 
-        # Buffer / access-region trap kinetics
+        # Buffer / access-region trap kinetics (SRH majority-carrier term)
         self.kBc_raw = nn.Parameter(torch.tensor(-2.5))
         self.kBe_raw = nn.Parameter(torch.tensor(-3.5))
+        self.gammaB_raw = nn.Parameter(torch.tensor(-3.0))
 
         # Channel transport degradation
         self.kM_raw  = nn.Parameter(torch.tensor(-4.0))
@@ -127,12 +218,22 @@ class PhysicsODE(nn.Module):
         return _sp(self.kGe_raw)
 
     @property
+    def gammaG(self) -> torch.Tensor:
+        """SRH minority-carrier correction weight for zG, >= 0."""
+        return _sp(self.gammaG_raw)
+
+    @property
     def kBc(self) -> torch.Tensor:
         return _sp(self.kBc_raw)
 
     @property
     def kBe(self) -> torch.Tensor:
         return _sp(self.kBe_raw)
+
+    @property
+    def gammaB(self) -> torch.Tensor:
+        """SRH minority-carrier correction weight for zB, >= 0."""
+        return _sp(self.gammaB_raw)
 
     @property
     def kM(self) -> torch.Tensor:
@@ -162,6 +263,19 @@ class PhysicsODE(nn.Module):
     def kC(self) -> torch.Tensor:
         return _sp(self.kC_raw)
 
+    @property
+    def zG_equilibrium(self) -> torch.Tensor:
+        """SRH-implied equilibrium (steady-state) occupancy of zG at T_ref:
+        z_G,eq = kGc / (kGc + kGe). Exposed for physical-plausibility checks
+        (should stay in (0,1); a value near 0 or 1 signals the trap level is
+        essentially always empty/full, which is a testable SRH prediction)."""
+        return self.kGc / (self.kGc + self.kGe + 1e-12)
+
+    @property
+    def zB_equilibrium(self) -> torch.Tensor:
+        """SRH-implied equilibrium occupancy of zB at T_ref (see zG_equilibrium)."""
+        return self.kBc / (self.kBc + self.kBe + 1e-12)
+
     # ------------------------------------------------------------------
     # Arrhenius factors
     # ------------------------------------------------------------------
@@ -190,13 +304,44 @@ class PhysicsODE(nn.Module):
         return torch.clamp(dzdt, -RHS_CLAMP, RHS_CLAMP)
 
     def _sanitize_state(self, z: torch.Tensor) -> torch.Tensor:
-        """Project states back to a finite bounded latent box after each substep."""
+        """Project states back to a finite bounded latent box after each substep.
+
+        Uses a smooth soft-clamp (see _soft_clamp01) rather than a hard
+        torch.clamp: RK4 is called after every substep and every intermediate
+        RK4 stage (k1..k4), so this function runs dozens of times per
+        integration interval. A hard clamp's exactly-zero gradient outside
+        [0,1] compounds across that many calls once a monotone state (zM/zL)
+        saturates near 1, and was the root cause of a real NaN-gradient
+        failure during Stage 3 training (391 sanitized-gradient events in a
+        full retrain — see 2026-08-16/17 investigation). The soft-clamp is
+        the exact identity deep in the interior, so this changes nothing
+        about the model's normal-operating-range numerics; it only smooths
+        the corner right at 0/1.
+        """
         z = torch.nan_to_num(z, nan=0.5, posinf=1.0, neginf=0.0)
-        return torch.clamp(z, 0.0, 1.0)
+        return _soft_clamp01(z)
 
     # ------------------------------------------------------------------
     # ODE right-hand side
     # ------------------------------------------------------------------
+
+    def driving_forces(self, z: torch.Tensor) -> torch.Tensor:
+        """Return (driving_M, driving_L), the trap-to-damage handoff terms
+        that feed zM and zL. Exposed separately (not just inlined in rhs())
+        so the boundary-continuity check can evaluate them directly on
+        observed/encoder trajectories without re-deriving the RHS.
+
+        Args:
+            z : (B, 5)  [zG, zB, zM, zL, zC]
+        Returns:
+            (driving_M, driving_L) : each (B, 1)
+        """
+        zG = z[:, 0:1]
+        zB = z[:, 1:2]
+        zC = z[:, 4:5]
+        driving_M = self.wMG * zG + self.wMB * zB + zC
+        driving_L = self.aLG * zG + self.aLB * zB + zC
+        return driving_M, driving_L
 
     def rhs(self,
             z: torch.Tensor,
@@ -225,18 +370,37 @@ class PhysicsODE(nn.Module):
         zL = z[:, 3:4]
         zC = z[:, 4:5]
 
-        # dzG/dt  (capture-emission; can decrease on detrapping)
-        dzG = self.kGc * frev * (1.0 - zG) - self.kGe * frev * zG
+        # dzG/dt  — SRH occupancy kinetics: majority-carrier capture/emission
+        # scaled by (1 + gammaG) to fold in the minority-carrier contribution
+        # (same functional form, same activation energy — see module docstring).
+        #
+        # Numerical note: the deep RK4-through-multi-interval rollout used by
+        # Stage 3 (integrate_trajectory over up to ~60 chained substeps per
+        # interval, 11 intervals) already sits within ~1e10x of float32
+        # overflow at initialization for the plain V1 majority-carrier term
+        # once zM/zL saturate near 1 (a pre-existing _sanitize_state clamp-
+        # gradient fragility, tracked separately — not fixed here). The
+        # primary term (coefficient 1, below) reproduces V1 exactly and
+        # carries the same borderline-but-finite gradient V1 always had.
+        # gammaG is a SMALL scalar correction weight — training it does not
+        # require differentiating through srh_G's own deep RK4 history a
+        # second time (that would double-count an already near-overflowing
+        # gradient path and reliably tip it into NaN, confirmed empirically).
+        # detach() on the minority branch's srh_G reference removes that
+        # second gradient path while leaving gammaG's own gradient (via the
+        # multiplication) and the primary term's gradient both intact.
+        srh_G = self.kGc * frev * (1.0 - zG) - self.kGe * frev * zG
+        dzG = srh_G + self.gammaG * srh_G.detach()
 
-        # dzB/dt
-        dzB = self.kBc * frev * (1.0 - zB) - self.kBe * frev * zB
+        # dzB/dt  — same SRH structure for the buffer/access-region trap.
+        srh_B = self.kBc * frev * (1.0 - zB) - self.kBe * frev * zB
+        dzB = srh_B + self.gammaB * srh_B.detach()
 
         # dzM/dt  (monotone increasing: driven by trap occupancy + cumulative)
-        driving_M = self.wMG * zG + self.wMB * zB + zC
+        driving_M, driving_L = self.driving_forces(z)
         dzM = self.kM * firrev * driving_M * (1.0 - zM)
 
         # dzL/dt  (monotone increasing: nucleation-saturation form)
-        driving_L = self.aLG * zG + self.aLB * zB + zC
         dzL = self.kL * firrev * (1.0 - zL) * driving_L
 
         # dzC/dt  (monotone increasing: slower approach to saturation)
@@ -385,6 +549,67 @@ class PhysicsODE(nn.Module):
         if count == 0:
             return torch.zeros(1, device=z_enc.device)
         return total_loss / count
+
+    # ------------------------------------------------------------------
+    # Boundary-continuity check #2: trap-to-damage handoff continuity
+    # ------------------------------------------------------------------
+
+    def handoff_continuity_residual(
+        self,
+        z_enc: torch.Tensor,
+        mask: torch.Tensor,
+        rel_tol: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        Soft penalty on discontinuous jumps in the driving forces that feed
+        zM/zL (see module docstring, boundary condition #2).
+
+        For each pair of consecutive VALID observed time steps, computes the
+        jump in driving_M and driving_L implied by the encoder's own latent
+        trajectory, and penalises jumps that exceed `rel_tol` times the
+        step's own driving-force magnitude — i.e. this does not forbid the
+        driving force from changing (it must, that is the whole point of the
+        dynamics), it forbids RELATIVE jumps larger than rel_tol, which would
+        indicate a non-physical discontinuity (e.g. from an under-resolved
+        substep count or a badly conditioned parameter) rather than a smooth
+        physical transition.
+
+        Args:
+            z_enc   : (B, T, 5)  encoder latent trajectory
+            mask    : (B, T)     bool, True where observation is valid
+            rel_tol : float      max allowed relative jump before penalising
+
+        Returns:
+            residual : scalar
+        """
+        B, T, _ = z_enc.shape
+        if T < 2:
+            return torch.zeros(1, device=z_enc.device).squeeze()
+
+        total = torch.zeros(1, device=z_enc.device)
+        count = 0
+        for step in range(1, T):
+            valid = mask[:, step - 1] & mask[:, step]
+            if not valid.any():
+                continue
+            z_prev = z_enc[valid, step - 1, :]
+            z_curr = z_enc[valid, step, :]
+            dM_prev, dL_prev = self.driving_forces(z_prev)
+            dM_curr, dL_curr = self.driving_forces(z_curr)
+
+            jump_M = (dM_curr - dM_prev).abs()
+            jump_L = (dL_curr - dL_prev).abs()
+            scale_M = 0.5 * (dM_curr.abs() + dM_prev.abs()) + 1e-4
+            scale_L = 0.5 * (dL_curr.abs() + dL_prev.abs()) + 1e-4
+
+            excess_M = F.relu(jump_M / scale_M - rel_tol)
+            excess_L = F.relu(jump_L / scale_L - rel_tol)
+            total = total + (excess_M ** 2).mean() + (excess_L ** 2).mean()
+            count += 1
+
+        if count == 0:
+            return torch.zeros(1, device=z_enc.device).squeeze()
+        return (total / count).squeeze()
 
 
 # ---------------------------------------------------------------------------

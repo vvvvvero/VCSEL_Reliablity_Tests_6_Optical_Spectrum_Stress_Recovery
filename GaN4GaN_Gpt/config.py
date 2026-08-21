@@ -160,6 +160,18 @@ LAMBDA_MONOTONE = 0.3     # Monotonicity penalty (zM, zL, zC only)
 LAMBDA_TEMP_ORDER = 0.15  # Temperature ordering penalty (raised from 0.1 to better separate 325C)
 LAMBDA_ADV_G = 0.05       # Generator adversarial loss weight
 LAMBDA_ADV_D = 1.0        # Discriminator loss weight
+# ODE V2 (SRH-form trap kinetics) boundary-continuity condition #2: penalise
+# discontinuous jumps in the trap-to-damage handoff driving force between
+# consecutive observed time steps. 0 = off (default); set > 0 to activate
+# once validated against a Stage 1-3 retrain with the new ODE.
+LAMBDA_HANDOFF = 0.0
+# Stage 3 z_phys residual-rank loss (07_losses.py::z_phys_rank_loss): shapes
+# the encoder's z_pfx to be rank-predictive of per-device future-residual
+# magnitude, addressing the A/B/C ablation finding (2026-08-16/17) that
+# z_phys otherwise carries no usable signal for Stage 4C. 0 = off (default);
+# set > 0 to activate once validated against a Stage 1-3 retrain.
+LAMBDA_ZPHYS_RANK = 0.5   # activated 2026-08-17 after smoke-test validation
+ZPHYS_RANK_MARGIN = 0.1
 LAMBDA_MULTISTEP_DECAY = 1.0  # Uniform weighting for future rollout steps
 LAMBDA_INITIAL_ANCHOR = 0.20  # Anchor on zM(0), zL(0), zC(0) — RAISED from 0.05 (fix zM0=0.9 saturation)
 

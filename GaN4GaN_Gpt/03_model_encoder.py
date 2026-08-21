@@ -69,6 +69,14 @@ class PhysicsEncoder(nn.Module):
         # Projection to latent space
         self.proj = nn.Linear(hidden_dim, latent_dim)
 
+        # Auxiliary scalar projection used only by z_phys_rank_loss
+        # (07_losses.py): learns a direction in z_pfx space that ranks
+        # devices by future-residual magnitude. Not part of the forward
+        # pass / decoder input — purely a training-time diagnostic+shaping
+        # signal, kept tiny (latent_dim params) to avoid adding overfitting
+        # risk on top of an already data-scarce regime.
+        self.resid_rank_proj = nn.Parameter(torch.zeros(latent_dim))
+
         self._init_weights()
 
     def _init_weights(self):

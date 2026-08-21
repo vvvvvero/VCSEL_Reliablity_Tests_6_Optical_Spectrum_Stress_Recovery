@@ -306,7 +306,7 @@ def main():
     loss_names = [
         "reconstruction_loss", "balanced_feature_huber_loss", "ode_residual_loss", "bounds_loss",
         "monotonicity_loss", "temperature_ordering_loss",
-        "zc_prefix_separation_loss", "multistep_prediction_loss", "adversarial_generator_loss",
+        "zc_prefix_separation_loss", "z_phys_rank_loss", "multistep_prediction_loss", "adversarial_generator_loss",
         "adversarial_discriminator_loss", "distribution_matching_loss",
         "total_physics_loss",
     ]

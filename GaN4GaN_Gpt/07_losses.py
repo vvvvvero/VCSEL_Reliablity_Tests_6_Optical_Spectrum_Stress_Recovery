@@ -357,6 +357,82 @@ def zc_prefix_separation_loss(
 
 
 # ---------------------------------------------------------------------------
+# 5b. z_phys residual-rank loss
+# ---------------------------------------------------------------------------
+#
+# Background: an A/B/C physics-conditioning ablation (2026-08-16/17) found
+# that the Stage 4C residual generator's CRPSS/coverage are statistically
+# indistinguishable whether it is conditioned on the real z_phys, a zeroed
+# z_phys, or a shuffled (wrong-device) z_phys. A follow-up diagnostic traced
+# this to Stage 1-3's training objective: it optimises point-forecast
+# accuracy (reconstruction + ODE consistency + multistep rollout) and never
+# asks the encoder to make z_phys informative about per-device FUTURE
+# RESIDUAL MAGNITUDE — so there is no reason the optimum found by that
+# objective would also happen to separate high-residual-variance devices
+# from low-residual-variance ones in z_phys space. A robustified (log1p)
+# correlation check did find a real but weak signal (zG, zL Spearman
+# r~-0.2/-0.27, p<0.05) already present incidentally; this loss makes
+# extracting that signal an explicit training objective instead of an
+# accident, using a pairwise RANKING formulation (not raw regression) so it
+# is inherently robust to the heavy-tailed, outlier-dominated distribution
+# of per-device residual magnitude found during the same diagnostic
+# (raw-scale CV~4.7, log1p CV~2.1).
+
+def z_phys_rank_loss(
+    z_pfx: torch.Tensor,          # (B, latent_dim) encoder state at prefix boundary
+    resid_magnitude: torch.Tensor,  # (B,) per-device future-residual magnitude (already robustified, e.g. log1p(std))
+    proj_weight: torch.Tensor,    # (latent_dim,) learnable projection z_pfx -> scalar score
+    margin: float = 0.1,
+) -> torch.Tensor:
+    """
+    Pairwise ranking loss: encourages a learned scalar projection of z_pfx to
+    rank devices in the same order as their true future-residual magnitude.
+
+    For every pair (i, j) in the batch with a resolvable ordering (resid_i !=
+    resid_j), penalises the projected score s = z_pfx @ proj_weight for not
+    respecting that order by at least `margin`:
+
+        L = mean over pairs of  relu(margin - sign(resid_i - resid_j) * (s_i - s_j))
+
+    Only cares about ORDER, not magnitude, so it is naturally robust to the
+    heavy right-skewed tail in residual magnitude (a few extreme-outlier
+    devices only contribute a few "obviously largest" pairwise comparisons,
+    rather than dominating a sum-of-squares regression target the way they
+    would in a direct MSE loss).
+
+    Args:
+        z_pfx           : (B, latent_dim)
+        resid_magnitude : (B,) — already robustified (e.g. log1p(std(resid)))
+        proj_weight      : (latent_dim,) — trained jointly, e.g.
+                            nn.Parameter(torch.zeros(latent_dim)) on the model
+        margin          : minimum required score gap for correctly-ordered pairs
+
+    Returns:
+        loss : scalar
+    """
+    B = z_pfx.shape[0]
+    if B < 2:
+        return torch.zeros(1, device=z_pfx.device).squeeze()
+
+    scores = z_pfx @ proj_weight   # (B,)
+
+    resid_diff  = resid_magnitude.unsqueeze(1) - resid_magnitude.unsqueeze(0)   # (B, B): r_i - r_j
+    score_diff  = scores.unsqueeze(1) - scores.unsqueeze(0)                     # (B, B): s_i - s_j
+
+    # Only count each unordered pair once, and only where the true residual
+    # magnitudes actually differ (a tie carries no ranking information).
+    pair_mask = torch.triu(torch.ones(B, B, dtype=torch.bool, device=z_pfx.device), diagonal=1)
+    resolvable = resid_diff.abs() > 1e-6
+    pair_mask = pair_mask & resolvable
+    if pair_mask.sum() == 0:
+        return torch.zeros(1, device=z_pfx.device).squeeze()
+
+    target_sign = torch.sign(resid_diff)
+    hinge = F.relu(margin - target_sign * score_diff)
+    return hinge[pair_mask].mean()
+
+
+# ---------------------------------------------------------------------------
 # 6. Temperature ordering loss
 # ---------------------------------------------------------------------------
 
@@ -671,6 +747,15 @@ def total_physics_loss(
         if include_temp_order
         else torch.zeros(1, device=x_hat.device).squeeze()
     )
+    # SRH-form ODE (02_physics_latent.py V2) boundary-continuity condition #2:
+    # trap-to-damage handoff must be continuous, not just algebraically valid.
+    # Off by default (LAMBDA_HANDOFF=0) — opt in via config once validated.
+    lambda_handoff = float(getattr(cfg, "LAMBDA_HANDOFF", 0.0))
+    L_handoff = (
+        ode_module.handoff_continuity_residual(z_enc, mask)
+        if lambda_handoff > 0 and hasattr(ode_module, "handoff_continuity_residual")
+        else torch.zeros(1, device=x_hat.device).squeeze()
+    )
 
     L_total = (
         cfg.LAMBDA_RECON   * L_recon  +
@@ -679,7 +764,8 @@ def total_physics_loss(
         cfg.LAMBDA_MONOTONE * L_mono  +
         cfg.LAMBDA_INITIAL_ANCHOR * L_anchor +
         cfg.LAMBDA_TEMP_ORDER * L_temp +
-        cfg.STAGE3_LAMBDA_LEAKAGE * L_leak
+        cfg.STAGE3_LAMBDA_LEAKAGE * L_leak +
+        lambda_handoff * L_handoff
     )
 
     return {
@@ -690,5 +776,6 @@ def total_physics_loss(
         "anchor": L_anchor,
         "temp":   L_temp,
         "leakage": L_leak,
+        "handoff": L_handoff,
         "total":  L_total,
     }

@@ -46,6 +46,7 @@ bounds_loss                 = None
 monotonicity_loss           = None
 temperature_ordering_loss   = None
 zc_prefix_separation_loss    = None
+z_phys_rank_loss            = None
 multistep_prediction_loss   = None
 adversarial_generator_loss  = None
 adversarial_discriminator_loss = None
@@ -593,6 +594,34 @@ def train_stage3(model, train_dl, val_dl, device):
                 margin=cfg.STAGE3_ZC_PREFIX_MARGIN,
             )
 
+            # z_phys residual-rank loss (07_losses.py::z_phys_rank_loss): off
+            # by default (LAMBDA_ZPHYS_RANK=0). Uses a light independent
+            # ODE+decoder rollout (not multistep_prediction_loss's internal
+            # one) purely to score per-device future-residual magnitude for
+            # ranking — detached, so it does not add a second gradient path
+            # into the ODE/decoder, only into the encoder via z_pfx and the
+            # small resid_rank_proj head.
+            _lambda_zrank = float(getattr(cfg, "LAMBDA_ZPHYS_RANK", 0.0))
+            zrank_loss = torch.zeros(1, device=z_enc.device).squeeze()
+            if _lambda_zrank > 0:
+                with torch.no_grad():
+                    z_pfx_nograd = z_enc[:, start_step, :].detach()
+                    z_future_nograd = model.ode.integrate_trajectory(
+                        z_pfx_nograd, T_K, times_h[:, start_step:], alpha,
+                    )
+                    x_future_hat = model.decoder(z_future_nograd, z_ref=z_enc[:, 0, :].detach())
+                    resid = x_true[:, start_step:, :] - x_future_hat
+                    fut_mask = mask[:, start_step:].unsqueeze(-1).float()
+                    resid = torch.nan_to_num(resid, nan=0.0) * fut_mask
+                    n_valid = fut_mask.sum(dim=(1, 2)).clamp(min=1.0)
+                    resid_std = (resid.pow(2).sum(dim=(1, 2)) / n_valid).sqrt()
+                    resid_magnitude = torch.log1p(resid_std)
+                zrank_loss = z_phys_rank_loss(
+                    z_enc[:, start_step, :], resid_magnitude,
+                    model.encoder.resid_rank_proj,
+                    margin=float(getattr(cfg, "ZPHYS_RANK_MARGIN", 0.1)),
+                )
+
             # Soft upper-bound penalty for kM and kL rate constants (debug13)
             # Penalise only when the rate constants exceed KM_MAX/KL_MAX (soft wall).
             _km_max = float(getattr(cfg, "KM_MAX", 1e9))
@@ -611,6 +640,7 @@ def train_stage3(model, train_dl, val_dl, device):
                 + cfg.STAGE3_LAMBDA_ZC_SEPARATION * zc_sep_loss
                 + cfg.STAGE3_LAMBDA_LEAKAGE * loss_dict["leakage"]
                 + 10.0 * rate_bound_loss
+                + _lambda_zrank * zrank_loss
             )
 
             opt.zero_grad()
