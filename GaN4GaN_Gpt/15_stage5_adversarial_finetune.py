@@ -677,11 +677,23 @@ def main():
     # Load Stage 4B / Stage 4C generator
     ckpt4b  = torch.load(args.checkpoint_stage4b, map_location=device)
     sd      = ckpt4b["state_dict"]
-    # Detect Stage 4C (stable-only) by checking output layer size
-    output_size = sd.get("net.5.bias", sd.get("net.6.bias", None))
     STABLE_IDX = mods["_s5_stage4b"].STABLE_FEAT_INDICES
+    # Detect phys-gated / Arrhenius-sigma checkpoints first (each has a
+    # submodule/parameter not present in the other variants) — checked before
+    # the plain-stable output-layer-size heuristic, since that shape check
+    # alone can't distinguish AR1GuidedResidualGeneratorStable from the newer
+    # variants.
+    is_phys_gated_ckpt  = any(k.startswith("z_phys_encoder.") for k in sd)
+    is_arrhenius_ckpt   = "log_Ea_sigma" in sd
+    output_size = sd.get("net.5.bias", sd.get("net.6.bias", None))
     is_stable_ckpt = (output_size is not None and output_size.numel() == 2 * mods["_s5_stage4b"].N_STABLE_FEATURES)
-    if is_stable_ckpt:
+    if is_arrhenius_ckpt:
+        log.info("Detected Arrhenius-sigma Stage 4C checkpoint (physically-constrained sigma(T))")
+        gen4b = mods["_s5_stage4b"].AR1GuidedResidualGeneratorArrhenius().to(device)
+    elif is_phys_gated_ckpt:
+        log.info("Detected phys-gated Stage 4C checkpoint (separate z_phys/context encoders)")
+        gen4b = mods["_s5_stage4b"].AR1GuidedResidualGeneratorPhysGated().to(device)
+    elif is_stable_ckpt:
         log.info("Detected Stage 4C checkpoint (stable-only, %d output features)",
                  mods["_s5_stage4b"].N_STABLE_FEATURES)
         gen4b = mods["_s5_stage4b"].AR1GuidedResidualGeneratorStable().to(device)

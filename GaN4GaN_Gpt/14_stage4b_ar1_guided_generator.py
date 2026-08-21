@@ -221,6 +221,179 @@ def physics_sensitivity_loss(
     return torch.relu(margin - response).mean()
 
 
+LAMBDA_ZPHYS_CONTRAST = 0.0   # default off; set > 0 to activate z_phys contrastive loss
+ZPHYS_CONTRAST_MARGIN = 0.02  # min required CRPS degradation (shuffled - real), in normalised units
+
+
+def _per_device_crps(
+    samples: "torch.Tensor",   # (S, B, T_future, F)
+    x_true_future: "torch.Tensor",   # (B, T_future, F)
+    future_mask: "torch.Tensor",     # (B, T_future) bool
+) -> "torch.Tensor":
+    """Per-device CRPS (energy-score MC estimator), NOT averaged over the
+    batch — returns (B,). Same formula as crps_mc_loss (13_stage4a...), but
+    reduced over (T_future, F) independently per device so the contrastive
+    loss below can compare real-z_phys vs shuffled-z_phys CRPS device-by-
+    device rather than only as a batch aggregate (which would wash out the
+    per-device signal the ablation is actually about)."""
+    S, B, T, F = samples.shape
+    valid = future_mask.unsqueeze(0).unsqueeze(-1).expand(S, B, T, F)   # (S,B,T,F)
+    x_true_exp = x_true_future.unsqueeze(0).expand(S, -1, -1, -1)
+    nan_mask = ~torch.isnan(x_true_exp)
+    final_mask = valid & nan_mask
+
+    samples_c = torch.nan_to_num(samples, nan=0.0)
+    s_clean = torch.where(nan_mask, samples_c, torch.zeros_like(samples_c))
+    y_clean = torch.where(nan_mask, x_true_exp, torch.zeros_like(x_true_exp))
+
+    denom = final_mask.float().sum(dim=(0, 2, 3)).clamp(min=1)   # (B,)
+    term1 = (torch.abs(s_clean - y_clean) * final_mask.float()).sum(dim=(0, 2, 3)) / denom   # (B,)
+
+    n_pairs = min(S, 8)
+    idx1 = torch.randperm(S, device=samples.device)[:n_pairs]
+    idx2 = torch.randperm(S, device=samples.device)[:n_pairs]
+    pair_mask = (future_mask.unsqueeze(-1) & ~torch.isnan(x_true_future)).unsqueeze(0).expand(n_pairs, -1, -1, -1)
+    s1 = s_clean[idx1]
+    s2 = s_clean[idx2]
+    pdenom = pair_mask.float().sum(dim=(0, 2, 3)).clamp(min=1)   # (B,)
+    term2 = (torch.abs(s1 - s2) * pair_mask.float()).sum(dim=(0, 2, 3)) / pdenom   # (B,)
+
+    return term1 - 0.5 * term2   # (B,)
+
+
+def z_phys_contrastive_loss(
+    generator,
+    z_pfx: "torch.Tensor",        # (B, latent_dim)
+    T_K: "torch.Tensor",
+    x0: "torch.Tensor",
+    log_t: "torch.Tensor",
+    x_true_future: "torch.Tensor",   # (B, T_future, F_stable)
+    future_mask: "torch.Tensor",     # (B, T_future) bool
+    x_hat_future: "torch.Tensor",    # (B, T_future, F_stable) deterministic backbone mean
+    n_samples: int = 4,
+    times_future: "torch.Tensor" = None,
+    margin: float = ZPHYS_CONTRAST_MARGIN,
+) -> "torch.Tensor":
+    """Directly optimises what the A/B/C ablation measures: real z_phys
+    should give a BETTER (lower) CRPS than a wrong device's shuffled z_phys.
+
+    physics_sensitivity_loss (above) only required the predicted (rho,sigma)
+    to CHANGE under a shuffled z_phys — satisfiable by reacting to z_phys
+    noise in a way that does not help or could even hurt prediction quality.
+    This loss closes that gap by scoring the actual downstream quantity
+    (per-device CRPS) under both conditions and penalising the model unless
+    real z_phys wins by at least `margin`:
+
+        L = mean_i  relu(margin - (CRPS_shuffled_i - CRPS_real_i))
+
+    Gradients flow through both the real-z_phys and shuffled-z_phys forward
+    passes into the SAME generator parameters, so satisfying this loss
+    requires the network to have actually learned a z_phys-dependent
+    function whose correctness (not just its existence) matters for CRPS —
+    the necessary-and-sufficient condition the ablation checks for.
+    """
+    B = z_pfx.shape[0]
+    if B <= 1:
+        return z_pfx.sum() * 0.0
+
+    deltas_real = generator.sample_n(z_pfx, T_K, x0, log_t, n_samples,
+                                      T_future=x_true_future.shape[1], times_future=times_future)
+    x_pred_real = x_hat_future.unsqueeze(0) + deltas_real
+    crps_real = _per_device_crps(x_pred_real, x_true_future, future_mask)   # (B,)
+
+    perm = torch.randperm(B, device=z_pfx.device)
+    z_shuffled = z_pfx[perm]
+    deltas_shuf = generator.sample_n(z_shuffled, T_K, x0, log_t, n_samples,
+                                      T_future=x_true_future.shape[1], times_future=times_future)
+    x_pred_shuf = x_hat_future.unsqueeze(0) + deltas_shuf
+    crps_shuf = _per_device_crps(x_pred_shuf, x_true_future, future_mask)   # (B,)
+
+    gap = crps_shuf - crps_real   # positive => real z_phys is better, as desired
+    return torch.relu(margin - gap).mean()
+
+
+LAMBDA_ARRHENIUS_TREND = 0.0   # default off; set > 0 to activate Arrhenius sigma-trend loss
+
+# Reference activation energies for residual-variance temperature scaling,
+# per stable feature [Vth, IDSS, RON, gmmax], fitted from a robustified
+# (MAD-based, outlier-resistant) per-temperature-bucket analysis of decoder
+# residuals on this dataset (2026-08-21 investigation). This is a FIXED
+# constant, not a learned parameter — AR1GuidedResidualGeneratorArrhenius
+# (a hard-constraint variant tried first) showed that when Ea_sigma is left
+# learnable inside the sigma-prediction path itself, the optimizer has no
+# pressure to move it off a sane init and the model instead collapses the
+# context-dependent correction term to near-zero. Keeping the reference
+# fixed and only constraining the population-level TREND (not individual
+# sigma values) avoids that failure mode: the MLP stays fully free to fit
+# per-device sigma, only the batch-averaged cross-temperature-group ratio
+# is nudged towards physical plausibility.
+ARRHENIUS_TREND_EA_REF = {0: 0.67, 1: 0.35, 2: 0.20, 3: 0.35}   # feature index -> Ea [eV]
+
+
+def arrhenius_trend_loss(
+    sigma_pred: "torch.Tensor",   # (B, n_features)
+    T_K: "torch.Tensor",          # (B,)
+    ea_ref: dict = ARRHENIUS_TREND_EA_REF,
+) -> "torch.Tensor":
+    """Soft population-level constraint: the BATCH-AVERAGE predicted sigma,
+    grouped by temperature, should scale across temperature groups
+    consistently with a physically-plausible Arrhenius activation energy —
+    without constraining any individual device's sigma.
+
+    For every pair of temperature groups (t_i, t_j) present in the batch,
+    compares the empirical log-ratio of mean sigma to the log-ratio implied
+    by the fixed reference Ea (see ARRHENIUS_TREND_EA_REF), and penalises
+    the squared difference:
+
+        log(sigma_bar(t_i)/sigma_bar(t_j)) should ~= -Ea/kB * (1/t_i - 1/t_j)
+
+    This targets exactly the quantity independently validated on this
+    dataset (population-level temperature scaling of residual variance,
+    confirmed via a robustified per-temperature-bucket fit — see
+    AR1GuidedResidualGeneratorArrhenius docstring), while leaving individual
+    predictions fully free — unlike the earlier hard-constraint variant,
+    there is no per-device sigma being pinned to a physical formula, so the
+    MLP cannot "give up" on device-level fitting to satisfy this term; it
+    only has to keep the handful of per-temperature-group AVERAGES on trend.
+    """
+    kb = cfg.KB_EV
+    B, F = sigma_pred.shape
+    temps_c = torch.round(T_K - 273.15).long()
+    unique_temps = torch.unique(temps_c)
+    if unique_temps.numel() < 2:
+        return torch.zeros((), device=sigma_pred.device, dtype=sigma_pred.dtype)
+
+    group_mean_sigma = {}   # tc -> (F,) mean sigma across devices in that group
+    group_T_K = {}
+    for tc in unique_temps.tolist():
+        idx = (temps_c == tc).nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            continue
+        group_mean_sigma[tc] = sigma_pred[idx].mean(dim=0)   # (F,)
+        group_T_K[tc] = float(tc) + cfg.CELSIUS_TO_KELVIN
+
+    temps_list = sorted(group_mean_sigma.keys())
+    if len(temps_list) < 2:
+        return torch.zeros((), device=sigma_pred.device, dtype=sigma_pred.dtype)
+
+    ea_t = torch.tensor([ea_ref.get(fi, 0.3) for fi in range(F)],
+                         device=sigma_pred.device, dtype=sigma_pred.dtype)   # (F,)
+
+    total = torch.zeros((), device=sigma_pred.device, dtype=sigma_pred.dtype)
+    n_pairs = 0
+    for i in range(len(temps_list)):
+        for j in range(i + 1, len(temps_list)):
+            ti, tj = temps_list[i], temps_list[j]
+            log_ratio_pred = torch.log(group_mean_sigma[ti].clamp(min=1e-6)) - \
+                              torch.log(group_mean_sigma[tj].clamp(min=1e-6))   # (F,)
+            inv_T_diff = 1.0 / group_T_K[ti] - 1.0 / group_T_K[tj]
+            log_ratio_target = -ea_t / kb * inv_T_diff   # (F,)
+            total = total + ((log_ratio_pred - log_ratio_target) ** 2).mean()
+            n_pairs += 1
+
+    return total / max(n_pairs, 1)
+
+
 LAMBDA_ACF = 0.0   # default off; set e.g. 0.10 for Stage 4C-ACF variant
 
 
@@ -642,6 +815,380 @@ class AR1GuidedResidualGeneratorStable(nn.Module):
         ], dim=0)   # (S, B, T_future, 4)
 
 
+class AR1GuidedResidualGeneratorPhysGated(nn.Module):
+    """Stage 4C generator variant with a structural physics bottleneck.
+
+    Motivation (2026-08-16..21 investigation): AR1GuidedResidualGeneratorStable
+    concatenates z_phys(5) directly into a 13-dim context vector alongside
+    T/t/x0(6) and feeds the whole thing into one shared MLP trunk. An A/B/C
+    physics-conditioning ablation found this generator's CRPSS/coverage were
+    statistically indistinguishable whether z_phys was real, zeroed, or
+    shuffled to a different device — the network learned to route around
+    z_phys and rely on x0 alone, because x0 is a strictly easier, lower-noise
+    signal for minimising CRPS and nothing in the architecture forced use of
+    the other branch. Root-caused via three ruled-out alternative
+    explanations (RK4 gradient instability, outlier-dominated regression
+    targets, encoder not being trained to encode a useful z_phys) — none of
+    which fixed the ablation result — before concluding the generator's own
+    architecture was the bottleneck.
+
+    Fix, structural half: z_phys and (T, t, x0) are each first mapped through
+    their OWN small encoder into an embedding of comparable width, and only
+    THEN concatenated and passed to the shared trunk. This does not
+    guarantee the trunk uses the z_phys embedding, but it removes the
+    "cheapest path" of just learning near-zero input weights on 5 of 13
+    raw-concatenated dimensions — the z_phys embedding now has to be
+    actively suppressed via the whole z_phys_encoder subnetwork, not simply
+    ignored by a few zeroed first-layer weights. Combined with
+    z_phys_contrastive_loss (07_losses.py) at training time, which
+    DIRECTLY penalises the model for producing an equally-good CRPS with a
+    shuffled z_phys — i.e. optimises the exact quantity the A/B/C ablation
+    measures, instead of leaving it as an unsupervised side effect.
+    """
+    STABLE_INDICES = STABLE_FEAT_INDICES   # [0, 1, 2, 3]
+    N_STABLE       = N_STABLE_FEATURES     # 4
+    LOG10_T_REF    = 0.35
+
+    def __init__(
+        self,
+        noise_dim:           int   = STAGE4B_NOISE_DIM,
+        hidden_dim:          int   = STAGE4B_HIDDEN_DIM,
+        n_output:            int   = N_STABLE_FEATURES,
+        latent_dim:          int   = cfg.LATENT_DIM,
+        n_context_feat:      int   = cfg.FEATURE_DIM,
+        z_embed_dim:         int   = 16,
+        ctx_embed_dim:       int   = 16,
+        log_scale_floor_init:float = DEFAULT_LOG_SCALE_FLOOR_INIT,
+    ):
+        super().__init__()
+        self.noise_dim      = noise_dim
+        self.n_features     = n_output
+        self.latent_dim     = latent_dim
+        self._n_ctx_feat    = n_context_feat
+        self._leakage_indices = []
+
+        # Separate encoders: z_phys cannot be shortcut around by a few
+        # near-zero first-layer weights, since it now has a dedicated
+        # nonlinear path with its own capacity that must be actively
+        # suppressed (not just ignored) for the model to end up ignoring it.
+        self.z_phys_encoder = nn.Sequential(
+            nn.Linear(latent_dim, z_embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(z_embed_dim),
+        )
+        # T_norm(1) + x0(n_context_feat) + log_t(1)
+        raw_ctx_dim = 1 + n_context_feat + 1
+        self.ctx_encoder = nn.Sequential(
+            nn.Linear(raw_ctx_dim, ctx_embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(ctx_embed_dim),
+        )
+
+        trunk_in_dim = noise_dim + z_embed_dim + ctx_embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(trunk_in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2 * n_output),
+        )
+        self.log_scale_floor = nn.Parameter(
+            torch.full((n_output,), float(log_scale_floor_init))
+        )
+        for sub in (self.z_phys_encoder, self.ctx_encoder, self.net):
+            for m in sub:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight, gain=0.15)
+                    nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
+        """Return (rho, sigma) tensors shaped (B, 4) for the 4 stable features."""
+        z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
+        x0            = torch.nan_to_num(x0,            nan=0.0, posinf=0.0, neginf=0.0)
+        T_K           = torch.nan_to_num(T_K,           nan=0.0, posinf=0.0, neginf=0.0)
+        log_t_suffix  = torch.nan_to_num(log_t_suffix,  nan=0.0, posinf=0.0, neginf=0.0)
+
+        if z_prefix_last.dim() == 1:
+            z_prefix_last = z_prefix_last.unsqueeze(0)
+        B   = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+
+        T_norm = ((T_K.reshape(-1) - 300.0) / 25.0).reshape(B, 1)
+        if x0.dim() == 1:
+            x0 = x0.unsqueeze(0)
+        if x0.dim() > 2:
+            x0 = x0.reshape(B, -1)
+        x0_ctx = x0[:, :self._n_ctx_feat]
+
+        log_t = log_t_suffix.reshape(B, -1)[:, :1]
+
+        z_embed   = self.z_phys_encoder(z_prefix_last.reshape(B, -1))
+        raw_ctx   = torch.cat([T_norm, x0_ctx.reshape(B, -1), log_t], dim=-1)
+        ctx_embed = self.ctx_encoder(raw_ctx)
+
+        if noise_init is None:
+            noise_init = torch.zeros(B, self.noise_dim, device=dev, dtype=z_embed.dtype)
+        else:
+            noise_init = torch.nan_to_num(noise_init, nan=0.0)
+            if noise_init.dim() == 1:
+                noise_init = noise_init.unsqueeze(0)
+
+        inp      = torch.cat([noise_init, z_embed, ctx_embed], dim=-1)
+        out      = self.net(inp)
+        rho      = torch.sigmoid(out[:, :self.n_features]) * 0.97
+        sig_floor= torch.exp(self.log_scale_floor).unsqueeze(0).expand(B, -1)
+        sigma    = sig_floor + F.softplus(out[:, self.n_features:])
+        return rho, sigma
+
+    def forward(self, z_prefix_last, T_K, x0, log_t_suffix, T_future=10, noise=None,
+                times_future=None):
+        """Continuous-time OU on the log10(1+t) axis (see AR1GuidedResidualGeneratorStable)."""
+        B   = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+        rho, sigma = self._context_params(z_prefix_last, T_K, x0, log_t_suffix)
+
+        rho_eff_per_step = None
+        if times_future is not None and times_future.shape[1] >= 2:
+            t = times_future.to(dev).clamp(min=0.0)
+            log1pt = torch.log10(1.0 + t)
+            delta_log10 = torch.zeros(B, T_future, device=dev)
+            delta_log10[:, 0] = self.LOG10_T_REF
+            if T_future > 1:
+                delta_log10[:, 1:] = (
+                    log1pt[:, 1:] - log1pt[:, :-1]
+                ).clamp(min=0.01, max=2.0)
+            expo = (delta_log10 / self.LOG10_T_REF).unsqueeze(-1)
+            rho_eff_per_step = rho.unsqueeze(1) ** expo
+
+        deltas = []
+        d_prev = torch.zeros(B, self.n_features, device=dev)
+        for t_idx in range(T_future):
+            eps   = torch.randn(B, self.n_features, device=dev)
+            rho_i = rho_eff_per_step[:, t_idx, :] if rho_eff_per_step is not None else rho
+            sq    = torch.sqrt((1.0 - rho_i ** 2).clamp(min=1e-6))
+            d_t   = rho_i * d_prev + sq * sigma * eps
+            deltas.append(d_t)
+            d_prev = d_t.detach()
+        return torch.stack(deltas, dim=1)   # (B, T_future, 4)
+
+    def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10,
+                 times_future=None):
+        return torch.stack([
+            self.forward(z_prefix_last, T_K, x0, log_t_suffix, T_future=T_future,
+                         times_future=times_future)
+            for _ in range(n_samples)
+        ], dim=0)   # (S, B, T_future, 4)
+
+
+class AR1GuidedResidualGeneratorArrhenius(nn.Module):
+    """Stage 4C generator variant with an Arrhenius-parameterised sigma.
+
+    Motivation (2026-08-21): three attempts to make the network LEARN to use
+    per-device z_phys (sensitivity loss, ranking loss, contrastive loss) all
+    failed — even the contrastive loss, trained directly against the exact
+    quantity later checked, only reached a 56% real-vs-shuffled win rate on
+    its own training set (chance is 50%) and inverted on held-out test
+    devices. The common failure mode: all three tried to recover a PER-DEVICE
+    signal from z_phys, and per-device residual variance turns out to be
+    dominated by outlier noise at this sample size (CV~5 raw, ~2 after log1p;
+    203 devices split across 4 device types x 3 temperatures) — there simply
+    isn't enough independent information per (type, temperature) cell to
+    learn an individual multiplier reliably.
+
+    This variant sidesteps that entirely by targeting a POPULATION-level
+    physical relationship instead: residual variance is a stochastic process
+    driven by the same thermally-activated defect kinetics as the
+    deterministic degradation (trap occupancy fluctuations, SRH recombination
+    noise), so it should itself follow an Arrhenius temperature dependence,
+
+        sigma_f(T) = sigma_ref,f * exp(-Ea_sigma,f / kB * (1/T - 1/T_ref))
+
+    A robustified per-temperature-bucket analysis of this dataset (MAD-based
+    std of decoder residuals, computed independently per stable feature)
+    confirmed this is physically supported: fitted Ea_sigma values are
+    0.17-0.83 eV across the 4 stable features (Vth: 0.67 eV, cleanly
+    monotone 275->300->325C) — the same order of magnitude as the trained
+    ODE's own Ea_rev (~0.28-0.30 eV) / Ea_irrev (~0.43-0.77 eV). Unlike
+    per-device z_phys signal, this only requires enough samples PER
+    TEMPERATURE BUCKET (41-52 devices each here), which this dataset has.
+
+    sigma_ref and Ea_sigma are hard-coded into the architecture as learnable
+    parameters (8 total: one ref-scale + one activation-energy per stable
+    feature) rather than left for an MLP to discover from noisy per-device
+    residuals — the physical form is now structurally guaranteed rather than
+    hoped-for via a loss term, closing the gap that made the previous three
+    loss-based attempts fail. Context (z_phys, x0) still contributes a small,
+    BOUNDED multiplicative correction around the Arrhenius baseline (not
+    replacing it), so per-device information can still help within a
+    physically-anchored envelope rather than being asked to explain
+    everything on its own.
+
+    rho keeps the same context-conditioned MLP form as
+    AR1GuidedResidualGeneratorStable — only the temperature-dependence of
+    sigma is being architecturally constrained here, since that was the
+    dimension with an independently verified physical signal.
+    """
+    STABLE_INDICES = STABLE_FEAT_INDICES   # [0, 1, 2, 3]
+    N_STABLE       = N_STABLE_FEATURES     # 4
+    LOG10_T_REF    = 0.35
+
+    def __init__(
+        self,
+        noise_dim:            int   = STAGE4B_NOISE_DIM,
+        hidden_dim:            int   = STAGE4B_HIDDEN_DIM,
+        n_output:              int   = N_STABLE_FEATURES,
+        latent_dim:            int   = cfg.LATENT_DIM,
+        n_context_feat:        int   = cfg.FEATURE_DIM,
+        sigma_ref_init:        float = 0.08,
+        # Ea_sigma init values per stable feature [Vth, IDSS, RON, gmmax],
+        # seeded from the robustified per-temperature-bucket fit on this
+        # dataset (see docstring); training can move these, this is only a
+        # sane starting point in the physically-plausible 0.1-1 eV range.
+        ea_sigma_init:         tuple = (0.67, 0.35, 0.20, 0.35),
+        correction_bound:      float = 0.5,   # max +-50% multiplicative deviation from Arrhenius baseline
+    ):
+        super().__init__()
+        self.noise_dim      = noise_dim
+        self.n_features     = n_output
+        self.latent_dim     = latent_dim
+        self._n_ctx_feat    = n_context_feat
+        self._leakage_indices = []
+        self.correction_bound = correction_bound
+
+        context_dim = latent_dim + 1 + n_context_feat + 1
+        in_dim      = noise_dim + context_dim
+
+        # rho + a small bounded log-correction on sigma (not sigma itself)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2 * n_output),   # [rho_raw(4), sigma_correction_raw(4)]
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.15)
+                nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+        # Arrhenius sigma parameters — the physical constraint, hard-coded
+        # into the architecture. log_sigma_ref ensures sigma_ref > 0 via exp;
+        # Ea_sigma similarly via exp(log_Ea_sigma) (same convention as
+        # PhysicsODE.Ea_rev/Ea_irrev in 02_physics_latent.py).
+        self.log_sigma_ref = nn.Parameter(torch.log(torch.full((n_output,), float(sigma_ref_init))))
+        ea_init_t = torch.tensor(ea_sigma_init[:n_output], dtype=torch.float32)
+        self.log_Ea_sigma = nn.Parameter(torch.log(ea_init_t.clamp(min=0.05)))
+
+    @property
+    def sigma_ref(self) -> torch.Tensor:
+        return torch.exp(self.log_sigma_ref)
+
+    @property
+    def Ea_sigma(self) -> torch.Tensor:
+        return torch.exp(self.log_Ea_sigma)
+
+    def _arrhenius_sigma(self, T_K: torch.Tensor) -> torch.Tensor:
+        """sigma_ref * exp(-Ea_sigma/kB * (1/T - 1/T_ref)), shape (B, n_features)."""
+        kb = cfg.KB_EV
+        T_ref = cfg.T_REF_K
+        T_K = T_K.reshape(-1, 1)
+        inv_T_diff = 1.0 / T_K.clamp(min=1.0) - 1.0 / T_ref
+        exponent = -self.Ea_sigma.unsqueeze(0) / kb * inv_T_diff
+        exponent = torch.clamp(exponent, -15.0, 15.0)
+        return self.sigma_ref.unsqueeze(0) * torch.exp(exponent)
+
+    def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
+        """Return (rho, sigma) tensors shaped (B, 4) for the 4 stable features."""
+        z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
+        x0            = torch.nan_to_num(x0,            nan=0.0, posinf=0.0, neginf=0.0)
+        T_K           = torch.nan_to_num(T_K,           nan=0.0, posinf=0.0, neginf=0.0)
+        log_t_suffix  = torch.nan_to_num(log_t_suffix,  nan=0.0, posinf=0.0, neginf=0.0)
+
+        if z_prefix_last.dim() == 1:
+            z_prefix_last = z_prefix_last.unsqueeze(0)
+        B   = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+
+        T_norm = ((T_K.reshape(-1) - 300.0) / 25.0).reshape(B, 1)
+        if x0.dim() == 1:
+            x0 = x0.unsqueeze(0)
+        if x0.dim() > 2:
+            x0 = x0.reshape(B, -1)
+        x0_ctx = x0[:, :self._n_ctx_feat]
+
+        log_t = log_t_suffix.reshape(B, -1)[:, :1]
+
+        ctx = torch.cat([z_prefix_last.reshape(B, -1), T_norm, x0_ctx.reshape(B, -1), log_t], dim=-1)
+
+        if noise_init is None:
+            noise_init = torch.zeros(B, self.noise_dim, device=dev, dtype=ctx.dtype)
+        else:
+            noise_init = torch.nan_to_num(noise_init, nan=0.0)
+            if noise_init.dim() == 1:
+                noise_init = noise_init.unsqueeze(0)
+
+        inp = torch.cat([noise_init, ctx], dim=-1)
+        out = self.net(inp)
+        rho = torch.sigmoid(out[:, :self.n_features]) * 0.97
+
+        # Physical baseline (structurally guaranteed Arrhenius form) times a
+        # small bounded multiplicative correction from context. tanh keeps
+        # the correction in [-correction_bound, +correction_bound] so context
+        # can nudge sigma but cannot override the physical temperature
+        # scaling — at init (net[-1]=0) correction=0 and sigma is EXACTLY
+        # the Arrhenius baseline.
+        sigma_base = self._arrhenius_sigma(T_K.reshape(-1))   # (B, n_features)
+        correction = self.correction_bound * torch.tanh(out[:, self.n_features:])
+        sigma = sigma_base * (1.0 + correction)
+        sigma = sigma.clamp(min=1e-4)
+        return rho, sigma
+
+    # Reference log10-time step (see AR1GuidedResidualGeneratorStable)
+    def forward(self, z_prefix_last, T_K, x0, log_t_suffix, T_future=10, noise=None,
+                times_future=None):
+        B   = z_prefix_last.shape[0]
+        dev = z_prefix_last.device
+        rho, sigma = self._context_params(z_prefix_last, T_K, x0, log_t_suffix)
+
+        rho_eff_per_step = None
+        if times_future is not None and times_future.shape[1] >= 2:
+            t = times_future.to(dev).clamp(min=0.0)
+            log1pt = torch.log10(1.0 + t)
+            delta_log10 = torch.zeros(B, T_future, device=dev)
+            delta_log10[:, 0] = self.LOG10_T_REF
+            if T_future > 1:
+                delta_log10[:, 1:] = (
+                    log1pt[:, 1:] - log1pt[:, :-1]
+                ).clamp(min=0.01, max=2.0)
+            expo = (delta_log10 / self.LOG10_T_REF).unsqueeze(-1)
+            rho_eff_per_step = rho.unsqueeze(1) ** expo
+
+        deltas = []
+        d_prev = torch.zeros(B, self.n_features, device=dev)
+        for t_idx in range(T_future):
+            eps   = torch.randn(B, self.n_features, device=dev)
+            rho_i = rho_eff_per_step[:, t_idx, :] if rho_eff_per_step is not None else rho
+            sq    = torch.sqrt((1.0 - rho_i ** 2).clamp(min=1e-6))
+            d_t   = rho_i * d_prev + sq * sigma * eps
+            deltas.append(d_t)
+            d_prev = d_t.detach()
+        return torch.stack(deltas, dim=1)   # (B, T_future, 4)
+
+    def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10,
+                 times_future=None):
+        return torch.stack([
+            self.forward(z_prefix_last, T_K, x0, log_t_suffix, T_future=T_future,
+                         times_future=times_future)
+            for _ in range(n_samples)
+        ], dim=0)   # (S, B, T_future, 4)
+
+
 def _fit_ar1_targets(
     x_true,
     x_hat,
@@ -762,6 +1309,8 @@ def train_stage4b(
     lambda_scale: float = LAMBDA_SCALE,
     lambda_calib: float = LAMBDA_CALIB,
     lambda_phys_sens: float = LAMBDA_PHYS_SENS,
+    lambda_zphys_contrast: float = LAMBDA_ZPHYS_CONTRAST,
+    lambda_arrhenius_trend: float = LAMBDA_ARRHENIUS_TREND,
     sigma_min: float = DEFAULT_SIGMA_MIN,
     output_dir: Optional[str] = None,
 ):
@@ -797,8 +1346,8 @@ def train_stage4b(
     log.info("=== Stage 4B: AR(1)-guided residual generator ===")
     log.info("  Epochs=%d  n_train_samples=%d  lr=%.2e", epochs, n_train_samples, lr)
     log.info("  n_val_samples=%d  sigma_min=%.4f", n_val_samples, sigma_min)
-    log.info("  Loss weights: CRPS(λ=%.2f) AR1(λ=%.2f) Var(λ=%.2f) Pin(λ=%.2f) Scale(λ=%.2f) Calib(λ=%.2f) PhysSens(λ=%.2f)",
-             lambda_crps, lambda_ar1, lambda_var, lambda_pinball, lambda_scale, lambda_calib, lambda_phys_sens)
+    log.info("  Loss weights: CRPS(λ=%.2f) AR1(λ=%.2f) Var(λ=%.2f) Pin(λ=%.2f) Scale(λ=%.2f) Calib(λ=%.2f) PhysSens(λ=%.2f) ZContrast(λ=%.2f) ArrTrend(λ=%.2f)",
+             lambda_crps, lambda_ar1, lambda_var, lambda_pinball, lambda_scale, lambda_calib, lambda_phys_sens, lambda_zphys_contrast, lambda_arrhenius_trend)
     log.info("=" * 60)
 
     for epoch in range(1, epochs + 1):
@@ -812,6 +1361,8 @@ def train_stage4b(
         train_acf_total   = 0.0
         train_calib_total = 0.0
         train_sens_total  = 0.0
+        train_contrast_total = 0.0
+        train_arrtrend_total = 0.0
         n_train_batches   = 0
 
         for rec in train_cache:
@@ -889,6 +1440,30 @@ def train_stage4b(
             if lambda_phys_sens > 0:
                 sens_l = physics_sensitivity_loss(generator, z_pfx, T_K, x0, log_t)
 
+            # z_phys contrastive loss (optional, activated when lambda_zphys_contrast > 0):
+            # real z_phys must give a strictly better CRPS than a shuffled one.
+            contrast_l = torch.tensor(0.0, device=device)
+            if lambda_zphys_contrast > 0:
+                future_mask_bool = mask[:, plen:].bool()
+                x_hat_future_raw = (
+                    x_hat[:, plen:, :][:, :, sfx] if stable_feat_indices is not None
+                    else x_hat[:, plen:, :]
+                ).detach()
+                contrast_l = z_phys_contrastive_loss(
+                    generator, z_pfx, T_K, x0, log_t,
+                    x_true_future=future_true, future_mask=future_mask_bool,
+                    x_hat_future=x_hat_future_raw, n_samples=n_train_samples,
+                    times_future=times_future_t,
+                )
+
+            # Arrhenius sigma-trend loss (optional, activated when lambda_arrhenius_trend > 0):
+            # batch-averaged sigma per temperature group should follow a
+            # physically-plausible Arrhenius scaling — soft, population-level,
+            # does not constrain any individual device's sigma.
+            arrtrend_l = torch.tensor(0.0, device=device)
+            if lambda_arrhenius_trend > 0:
+                arrtrend_l = arrhenius_trend_loss(sigma_pred, T_K)
+
             loss = (
                 lambda_crps * crps
                 + lambda_ar1 * rho_loss
@@ -898,6 +1473,8 @@ def train_stage4b(
                 + lambda_acf  * acf_l
                 + lambda_calib * calib_l
                 + lambda_phys_sens * sens_l
+                + lambda_zphys_contrast * contrast_l
+                + lambda_arrhenius_trend * arrtrend_l
             )
 
             opt.zero_grad()
@@ -913,6 +1490,8 @@ def train_stage4b(
             train_acf_total   += acf_l.item()
             train_calib_total += calib_l.item()
             train_sens_total  += sens_l.item()
+            train_contrast_total += contrast_l.item()
+            train_arrtrend_total += arrtrend_l.item()
             n_train_batches += 1
 
         if n_train_batches == 0:
@@ -983,7 +1562,7 @@ def train_stage4b(
 
         elapsed = time.time() - t0
         log.info(
-            "Epoch %3d/%d | train_CRPS=%.4f  val_CRPS=%.4f | AR1=%.4f  Var=%.4f  ACF=%.4f  Calib=%.4f  Sens=%.4f"
+            "Epoch %3d/%d | train_CRPS=%.4f  val_CRPS=%.4f | AR1=%.4f  Var=%.4f  ACF=%.4f  Calib=%.4f  Sens=%.4f  ZContrast=%.4f  ArrTrend=%.4f"
             " | innov(mu=%.3f,std=%.3f,|k|=%.2f) | %.0fs",
             epoch, epochs, train_crps_avg, val_crps_avg,
             train_ar1_total   / n_train_batches,
@@ -991,6 +1570,8 @@ def train_stage4b(
             train_acf_total   / n_train_batches,
             train_calib_total / n_train_batches,
             train_sens_total  / n_train_batches,
+            train_contrast_total / n_train_batches,
+            train_arrtrend_total / n_train_batches,
             innov_diag["mean"], innov_diag["std"], innov_diag.get("abs_kurt", float("nan")),
             elapsed,
         )
@@ -1185,6 +1766,17 @@ def _parse_args():
     p.add_argument("--lambda-phys-sens", type=float, default=LAMBDA_PHYS_SENS,
         help="Weight for physics-latent sensitivity loss (0=off). Penalises "
              "the generator for predicting (rho,sigma) insensitive to z_phys.")
+    p.add_argument("--lambda-zphys-contrast", type=float, default=LAMBDA_ZPHYS_CONTRAST,
+        help="Weight for z_phys contrastive loss (0=off). Penalises the "
+             "generator unless real z_phys gives strictly better CRPS than "
+             "a shuffled (wrong-device) z_phys.")
+    p.add_argument("--lambda-arrhenius-trend", type=float, default=LAMBDA_ARRHENIUS_TREND,
+        help="Weight for the Arrhenius sigma-trend loss (0=off). Soft, "
+             "population-level constraint: batch-averaged sigma per "
+             "temperature group should follow a physically-plausible "
+             "Arrhenius scaling, without pinning any individual device's "
+             "sigma (use with AR1GuidedResidualGeneratorStable / "
+             "--stable-only, not --arrhenius-sigma).")
     p.add_argument("--sigma-min", type=float, default=DEFAULT_SIGMA_MIN)
     p.add_argument("--log-scale-floor-init", type=float, default=DEFAULT_LOG_SCALE_FLOOR_INIT)
     p.add_argument("--stage3-ckpt", type=str, default=None)
@@ -1195,6 +1787,18 @@ def _parse_args():
     p.add_argument("--smoke-test", action="store_true", help="Run a lightweight smoke test without the full dataset")
     p.add_argument("--stable-only", action="store_true",
         help="Stage 4C mode: train AR1GuidedResidualGeneratorStable on stable features only.")
+    p.add_argument("--phys-gated", action="store_true",
+        help="Use AR1GuidedResidualGeneratorPhysGated (separate z_phys/context "
+             "encoders) instead of AR1GuidedResidualGeneratorStable. Implies "
+             "--stable-only. Recommended together with --lambda-zphys-contrast.")
+    p.add_argument("--arrhenius-sigma", action="store_true",
+        help="Use AR1GuidedResidualGeneratorArrhenius: sigma(T) is "
+             "structurally constrained to an Arrhenius temperature "
+             "dependence (learnable Ea_sigma/sigma_ref per feature) instead "
+             "of being freely predicted by the MLP. Implies --stable-only. "
+             "Population-level physical constraint (validated on this "
+             "dataset), unlike the per-device z_phys approaches which did "
+             "not generalise to held-out devices.")
     p.add_argument("--lambda-acf", type=float, default=LAMBDA_ACF,
         help="Weight for ACF matching loss (0=off). Use e.g. 0.10 for Stage 4C-ACF variant.")
     return p.parse_args()
@@ -1286,7 +1890,26 @@ def main():
         log.info("Loaded Stage 3 checkpoint: %s", stage3_ckpt)
 
     is_stable = getattr(args, "stable_only", False)
-    if is_stable:
+    is_phys_gated = getattr(args, "phys_gated", False)
+    is_arrhenius = getattr(args, "arrhenius_sigma", False)
+    if is_arrhenius:
+        log.info("Stage 4C mode: Arrhenius-sigma generator (physically-constrained sigma(T)), stable features %s",
+                 STABLE_FEAT_INDICES)
+        generator = AR1GuidedResidualGeneratorArrhenius(
+            noise_dim=args.noise_dim,
+            hidden_dim=args.hidden_dim,
+        ).to(device)
+        stable_fi  = STABLE_FEAT_INDICES
+    elif is_phys_gated:
+        log.info("Stage 4C mode: phys-gated generator (separate z_phys/context encoders), stable features %s",
+                 STABLE_FEAT_INDICES)
+        generator = AR1GuidedResidualGeneratorPhysGated(
+            noise_dim=args.noise_dim,
+            hidden_dim=args.hidden_dim,
+            log_scale_floor_init=args.log_scale_floor_init,
+        ).to(device)
+        stable_fi  = STABLE_FEAT_INDICES
+    elif is_stable:
         log.info("Stage 4C mode: generating only stable features %s", STABLE_FEAT_INDICES)
         generator = AR1GuidedResidualGeneratorStable(
             noise_dim=args.noise_dim,
@@ -1325,6 +1948,8 @@ def main():
             lambda_acf=getattr(args, 'lambda_acf', LAMBDA_ACF),
             lambda_calib=getattr(args, 'lambda_calib', LAMBDA_CALIB),
             lambda_phys_sens=getattr(args, 'lambda_phys_sens', LAMBDA_PHYS_SENS),
+            lambda_zphys_contrast=getattr(args, 'lambda_zphys_contrast', LAMBDA_ZPHYS_CONTRAST),
+            lambda_arrhenius_trend=getattr(args, 'lambda_arrhenius_trend', LAMBDA_ARRHENIUS_TREND),
             sigma_min=args.sigma_min,
             output_dir=ckpt_dir,
             stable_feat_indices=stable_fi,
