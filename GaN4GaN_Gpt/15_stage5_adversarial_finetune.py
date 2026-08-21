@@ -58,6 +58,15 @@ LAMBDA_ADV         = 0.005   # very small adversarial regulariser
 LAMBDA_VAR         = 0.30    # keep variance loss from Stage 4B
 LAMBDA_AR1         = 0.50    # keep AR1 loss from Stage 4B
 LAMBDA_PHYS_PRESERVE = cfg.STAGE5_PHYSICS_WEIGHT   # penalise ensemble-mean drift from ODE mean
+# Hard floor on predicted sigma relative to the pre-Stage-5 (Stage 4C)
+# baseline, as a fraction. Added 2026-08-21 alongside the smaller
+# discriminator: the adversarial term alone was found to shrink sigma
+# ~40-45% across all stable features even while nominally "small"
+# (lambda_adv auto-calibrated to ~0.005-0.5) — this is a hard backstop, not
+# another soft loss weight to tune, since a soft penalty of the same kind
+# as LAMBDA_VAR did not previously prevent the collapse.
+LAMBDA_SIGMA_FLOOR = 1.0
+SIGMA_FLOOR_RATIO  = 0.90   # sigma must stay >= 90% of the Stage 4C reference
 N_TRAIN_SAMPLES    = 4
 N_VAL_SAMPLES      = 20
 PATIENCE           = 6
@@ -93,13 +102,24 @@ class ResidualDiscriminator(nn.Module):
     patterns: low ACF generates large increments (noisy), high ACF generates small
     increments (smooth).  This is key for detecting when generated trajectories
     have the wrong temporal structure even if their marginal distribution is correct.
+
+    Capacity note (2026-08-21): default hidden_dim/num_layers were reduced
+    from 64/2 to 16/1. With only 143 training devices (~9 batches/epoch at
+    batch_size=16), a 64-hidden 2-layer GRU discriminator has far more
+    capacity than the training set has independent samples — it was found
+    to drive the generator to shrink sigma ~40-45% across all stable
+    features (a real, measured collapse: Cov90 0.92->0.75 on full-sample
+    eval), consistent with the discriminator learning to associate "real"
+    with narrow, training-set-specific residual magnitudes rather than a
+    genuinely generalizable real-vs-fake distinction. A much smaller
+    discriminator is now sized closer to the data regime.
     """
 
     def __init__(
         self,
         feature_dim: int = cfg.FEATURE_DIM,
-        hidden_dim:  int = 64,
-        num_layers:  int = 2,
+        hidden_dim:  int = 16,
+        num_layers:  int = 1,
     ):
         super().__init__()
         # 2 * feature_dim for [residual || increment] + 1 for T_norm
@@ -179,6 +199,22 @@ def _coverage90_counts(x_pred_full: "torch.Tensor", x_true: "torch.Tensor",
     return hits, total
 
 
+def sigma_floor_loss(sigma_pred: torch.Tensor, sigma_ref: torch.Tensor,
+                      floor_ratio: float = SIGMA_FLOOR_RATIO) -> torch.Tensor:
+    """Hard backstop against the adversarial term shrinking sigma.
+
+    Penalises sigma_pred falling below floor_ratio * sigma_ref (the frozen
+    Stage 4C generator's own prediction on the same context, snapshotted
+    before Stage 5 touches any weights). Zero loss whenever sigma_pred is at
+    or above the floor — this does not push sigma to be LARGER than the
+    Stage 4C reference, only prevents the adversarial objective from making
+    it substantially smaller, which is the specific failure mode observed
+    (Cov90 0.92->0.75 from an unconstrained ~40-45% sigma shrink).
+    """
+    floor = floor_ratio * sigma_ref
+    return torch.relu(floor - sigma_pred).mean()
+
+
 def physics_preserve_loss(deltas: torch.Tensor, mask: "torch.Tensor" = None) -> torch.Tensor:
     """L_phys-preserve = || (1/M) sum_m x_fake^(m) - mu_phys ||^2.
 
@@ -227,6 +263,8 @@ def train_stage5(
     lambda_var:      float = LAMBDA_VAR,
     lambda_ar1:      float = LAMBDA_AR1,
     lambda_phys_preserve: float = LAMBDA_PHYS_PRESERVE,
+    lambda_sigma_floor: float = LAMBDA_SIGMA_FLOOR,
+    sigma_floor_ratio: float = SIGMA_FLOOR_RATIO,
     n_train_samples: int   = N_TRAIN_SAMPLES,
     n_val_samples:   int   = N_VAL_SAMPLES,
     patience:        int   = PATIENCE,
@@ -248,6 +286,21 @@ def train_stage5(
 
     disc = ResidualDiscriminator(feature_dim=len(STABLE_IDX) if is_stable_gen else cfg.FEATURE_DIM).to(device)
     disc.train()
+
+    # Snapshot each training record's Stage 4C (pre-Stage-5) sigma prediction
+    # BEFORE the generator is touched — this is the reference the sigma-floor
+    # guard (below) protects against being eroded by the adversarial term.
+    # Keyed by id() of the cached record dict (stable across the whole run
+    # since train_cache is a fixed list built once, before training starts).
+    generator.eval()
+    with torch.no_grad():
+        _s4c_sigma_ref = {}
+        for rec in train_cache:
+            _, sigma0 = generator._context_params(
+                rec["z_pfx"].to(device), rec["T_K"].to(device),
+                rec["x0"].to(device), rec["log_t"].to(device),
+            )
+            _s4c_sigma_ref[id(rec)] = sigma0.detach()
 
     # Physics modules are FROZEN — only generator + discriminator trained
     model3.eval()
@@ -384,7 +437,7 @@ def train_stage5(
         disc.train()
         t0 = time.time()
 
-        g_crps_sum = g_adv_sum = g_var_sum = g_ar1_sum = g_phys_sum = 0.0
+        g_crps_sum = g_adv_sum = g_var_sum = g_ar1_sum = g_phys_sum = g_sigfloor_sum = 0.0
         d_loss_sum = disc_acc_sum = diversity_sum = 0.0
         r_grad_sum = 0.0
         n_batches = 0
@@ -469,9 +522,16 @@ def train_stage5(
             # the frozen ODE/decoder mean (deltas already zero-centred target).
             phys_l = physics_preserve_loss(deltas, future_mask)
 
+            # Hard sigma floor: adversarial term cannot shrink sigma below
+            # sigma_floor_ratio * (pre-Stage-5 Stage 4C prediction on this
+            # same context). See sigma_floor_loss docstring / LAMBDA_SIGMA_FLOOR.
+            sigma_ref = _s4c_sigma_ref[id(rec)]
+            sigfloor_l = sigma_floor_loss(sigma_p, sigma_ref, floor_ratio=sigma_floor_ratio)
+
             g_loss = (
                 lambda_crps * crps_l + lambda_ar1 * ar1_l + lambda_var * var_l
                 + _lambda_adv * adv_l + lambda_phys_preserve * phys_l
+                + lambda_sigma_floor * sigfloor_l
             )
             opt_g.zero_grad()
             g_loss.backward()
@@ -483,6 +543,7 @@ def train_stage5(
             g_var_sum   += var_l.item()
             g_ar1_sum   += ar1_l.item()
             g_phys_sum  += phys_l.item()
+            g_sigfloor_sum += sigfloor_l.item()
             d_loss_sum  += d_loss.item()
             disc_acc_sum+= disc_acc
             diversity_sum += _diversity(deltas)
@@ -611,10 +672,10 @@ def train_stage5(
             collapse_count = 0
 
         log.info(
-            "Epoch %3d/%d | val_CRPS=%.4f (S4B=%.4f) | G_CRPS=%.4f G_adv=%.4f G_phys=%.5f "
+            "Epoch %3d/%d | val_CRPS=%.4f (S4B=%.4f) | G_CRPS=%.4f G_adv=%.4f G_phys=%.5f G_sigfloor=%.5f "
             "| disc_acc=%.3f div_ratio=%.2f Cov90=%.3f(S4B=%.3f,ratio=%.2f) | r_meas=%.4g lam_adv=%.6f | guards=%s | %.0fs",
             epoch, epochs, val_crps, stage4b_val_crps,
-            g_crps_sum / n_batches, g_adv_sum / n_batches, g_phys_sum / n_batches,
+            g_crps_sum / n_batches, g_adv_sum / n_batches, g_phys_sum / n_batches, g_sigfloor_sum / n_batches,
             avg_disc_acc, div_ratio, val_cov90, stage4b_cov90 if stage4b_cov90 is not None else float("nan"), cov90_ratio,
             r_meas_epoch, _lambda_adv,
             "PASS" if guard_pass else f"FAIL({collapse_count})",
@@ -669,6 +730,11 @@ def main():
     ap.add_argument("--lambda-var",    type=float, default=LAMBDA_VAR)
     ap.add_argument("--lambda-ar1",    type=float, default=LAMBDA_AR1)
     ap.add_argument("--lambda-phys-preserve", type=float, default=LAMBDA_PHYS_PRESERVE)
+    ap.add_argument("--lambda-sigma-floor", type=float, default=LAMBDA_SIGMA_FLOOR,
+        help="Weight for the hard sigma-floor guard (0=off). Prevents the "
+             "adversarial term from shrinking sigma below sigma_floor_ratio "
+             "of the pre-Stage-5 Stage 4C prediction.")
+    ap.add_argument("--sigma-floor-ratio", type=float, default=SIGMA_FLOOR_RATIO)
     ap.add_argument("--crps-tol",      type=float, default=CRPS_TOL)
     ap.add_argument("--diversity-floor",type=float,default=DIVERSITY_FLOOR)
     ap.add_argument("--disc-acc-ceil", type=float, default=DISC_ACC_CEIL)
@@ -842,6 +908,8 @@ def main():
         lambda_var=args.lambda_var,
         lambda_ar1=args.lambda_ar1,
         lambda_phys_preserve=args.lambda_phys_preserve,
+        lambda_sigma_floor=args.lambda_sigma_floor,
+        sigma_floor_ratio=args.sigma_floor_ratio,
         crps_tol=args.crps_tol,
         diversity_floor=args.diversity_floor,
         disc_acc_ceil=args.disc_acc_ceil,
