@@ -126,6 +126,12 @@ DISC_GRU_LAYERS = 1
 # Fixed-step RK4 substeps between consecutive log-time observations
 # Each log-decade is divided into ODE_SUBSTEPS steps
 ODE_SUBSTEPS_PER_LOG_DECADE = 20
+# Use the IMEX / exponential integrator (exact closed-form update for the
+# fast linear trap modes zG/zB, RK4 for the slow nonlinear zM/zL/zC).
+# The fast modes relax in ~5-8 h while the observation grid steps out to
+# dt = 1000 h, so plain explicit RK4 is outside its stability region on the
+# long steps. Set False to restore the old pure-RK4 path for comparison.
+ODE_USE_IMEX = True
 # Minimum physical dt [hours] for ODE substeps
 ODE_MIN_DT_H = 0.05
 
