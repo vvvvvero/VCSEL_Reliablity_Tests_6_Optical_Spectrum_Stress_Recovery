@@ -131,6 +131,16 @@ SOFT_CLAMP_BETA = 100.0
 # out-of-range gradient (9.4e-14) and the saturation behaviour are unchanged.
 SOFT_CLAMP_MARGIN = 0.20
 
+# --- DeviceAlphaNet conditioning (see the DeviceAlphaNet docstring) --------
+# Divisor on the tanh argument. 1.0 (the original) saturated 100 % of devices
+# and pinned alpha at its lower bound with zero gradient. 3.0 widens the
+# responsive input band ~3x; the reachable alpha range is unchanged.
+ALPHA_TANH_SLOPE = 3.0
+# Std of the final-layer weight init. The PyTorch default (U(-1/sqrt(16),
+# 1/sqrt(16)) ~ +-0.25) over 16 hidden units can put |alpha_raw| in the
+# saturated region before training starts; 0.01 begins near alpha=1.0.
+ALPHA_HEAD_INIT_STD = 0.01
+
 # ---------------------------------------------------------------------------
 # Helper: softplus parameter factory (guarantees positivity)
 # ---------------------------------------------------------------------------
@@ -764,6 +774,33 @@ class DeviceAlphaNet(nn.Module):
     Architecture: small MLP  [x0_static (6) + T_norm (1)] → α (1)
     Output is bounded to [1/ALPHA_MAX, ALPHA_MAX] to avoid extreme
     zC growth rates from outlier devices.
+
+    Saturation history (why the code looks like this)
+    -------------------------------------------------
+    An earlier version fed ``log1p(clamp(x0, min=0))`` and squashed with a
+    unit-slope ``tanh``. Measured on the trained checkpoint, that combination
+    killed alpha completely: alpha_raw drifted to -5.09, tanh saturated to
+    -0.9999 for 100 % of devices, d(alpha)/d(raw) vanished, and every device
+    sat pinned at the lower bound (alpha std = 3.3e-05 across 170 devices).
+
+    Two compounding causes, both fixed below:
+
+    1. ``clamp(x0, min=0)`` — x0 here is the *normalised absolute* initial
+       parameter value (std ~ 1, symmetric about 0), NOT a degradation ratio,
+       so the clamp flattened the entire negative half onto zero: 99.5 % of
+       RON, 99.0 % of IGLeak, 94.6 % of IDLeak values were destroyed. 52.7 %
+       of devices ended up with an all-zero input vector and the number of
+       distinguishable devices collapsed from 202/203 to 80/203. asinh is the
+       right transform: sign-preserving, ~linear near 0, log-like in the tails.
+
+    2. Unit-slope tanh with a default-initialised output layer put the model
+       in the saturated region from the start, so the gradient could never
+       recover once it drifted. A gentler slope plus a small final-layer
+       initialisation keeps alpha in the responsive region.
+
+    alpha is NOT structurally unidentifiable — forcing it from 0.5 to 2.0
+    moves x_pred by up to 0.235, which is the same magnitude as the entire
+    test RMSE (0.240). It simply never received gradient.
     """
 
     def __init__(self, input_dim: int = cfg.FEATURE_DIM + 1,
@@ -774,8 +811,11 @@ class DeviceAlphaNet(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
-        # Initialize around alpha=1.0 (tanh(0)=0 -> exp(0)=1).
+        # Start near alpha=1.0 (tanh(0)=0 -> exp(0)=1) AND near the linear
+        # part of the tanh: a small final weight keeps |alpha_raw| << the
+        # saturation scale for the first steps, so gradient actually flows.
         with torch.no_grad():
+            nn.init.normal_(self.net[-1].weight, std=ALPHA_HEAD_INIT_STD)
             self.net[-1].bias.fill_(0.0)
 
     def forward(self,
@@ -789,13 +829,19 @@ class DeviceAlphaNet(nn.Module):
         Returns:
             alpha     : (B,)    per-device rate multiplier > 0
         """
-        # Compress wide-ranging absolute parameters before feeding the MLP.
-        # This avoids tanh saturation on raw magnitudes and makes α depend on
-        # relative differences rather than feature scale.
-        x0_feat = torch.log1p(torch.clamp(x0_static, min=0.0))
+        # Compress the wide dynamic range WITHOUT discarding the sign: x0 is
+        # normalised and symmetric about 0, so clamping at 0 would erase most
+        # of the per-device information (see the class docstring). asinh is
+        # ~identity near 0 and ~log in the tails, so outlier devices are tamed
+        # while the negative half survives intact.
+        x0_feat = torch.asinh(x0_static)
         T_norm = ((T_K - cfg.T_REF_K) / cfg.T_REF_K).unsqueeze(1)  # (B,1)
         inp = torch.cat([x0_feat, T_norm], dim=1)                    # (B,7)
         alpha_raw = self.net(inp).squeeze(1)
         scale = math.log(float(cfg.ALPHA_MAX))
-        alpha = torch.exp(scale * torch.tanh(alpha_raw))
+        # Gentler slope keeps the map in the responsive part of tanh. The
+        # reachable range is unchanged -- still exactly [1/ALPHA_MAX,
+        # ALPHA_MAX] -- but saturation now needs |alpha_raw| ~ 3x larger,
+        # which is what lets gradient survive.
+        alpha = torch.exp(scale * torch.tanh(alpha_raw / ALPHA_TANH_SLOPE))
         return alpha
