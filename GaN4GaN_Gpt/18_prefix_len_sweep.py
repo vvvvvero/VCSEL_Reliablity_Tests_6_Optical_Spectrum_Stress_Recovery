@@ -82,8 +82,12 @@ def _train_one(prefix_len: int, ckpt_dir: str, log_path: str) -> bool:
     """
     os.makedirs(ckpt_dir, exist_ok=True)
     driver = os.path.join(ckpt_dir, "_train_driver.py")
-    with open(driver, "w") as fh:
+    # NOTE: the embedded BASE_DIR contains non-ASCII characters (the repo path
+    # includes "Łukasiewicz"), so the generated file must be written AND
+    # declared as UTF-8 or Python refuses to parse it.
+    with open(driver, "w", encoding="utf-8") as fh:
         fh.write(
+            "# -*- coding: utf-8 -*-\n"
             "import sys, os\n"
             f"sys.path.insert(0, r'{BASE_DIR}')\n"
             "import config as cfg\n"
