@@ -803,9 +803,13 @@ class DeviceAlphaNet(nn.Module):
     test RMSE (0.240). It simply never received gradient.
     """
 
-    def __init__(self, input_dim: int = cfg.FEATURE_DIM + 1,
+    def __init__(self, input_dim: int = None,
                  hidden_dim: int = 16):
         super().__init__()
+        # x0 keeps its six base columns even when the observation set is
+        # extended, so size from X0_STATIC_DIM rather than FEATURE_DIM.
+        if input_dim is None:
+            input_dim = getattr(cfg, "X0_STATIC_DIM", cfg.FEATURE_DIM) + 1
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.Tanh(),

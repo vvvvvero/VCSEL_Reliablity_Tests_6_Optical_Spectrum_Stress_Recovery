@@ -42,9 +42,40 @@ PARAM_FILE_PATTERNS = {
     "gmmax":  "gmmax",
 }
 
-# Ordered feature list (defines x1..x6)
-FEATURES = ["Vth", "IDSS", "RON", "gmmax", "IDLeak", "IGLeak"]
-FEATURE_DIM = len(FEATURES)   # 6
+# ---------------------------------------------------------------------------
+# Observation set
+# ---------------------------------------------------------------------------
+# EXTENDED_FEATURES switches between the original six extracted scalars and
+# the 12-feature set that adds curve-shape observables from the raw IDVG/IDVD
+# sweeps (built by 22_build_extended_dataset.py into processed_data_ext.pkl).
+#
+# Why the extra six exist: with only the original scalars the decoder's
+# main-channel rows (Vth, IDSS, RON, gmmax) share an identical sparsity
+# pattern, so zG/zB/zM are interchangeable -- measured effective rank 1.06 out
+# of 4, with zB and zM reproducible from the other latents to within 1.7 %.
+# That is why alpha never identifies and why the A/B/C physics-conditioning
+# ablation compares three informationally identical models. See
+# DECODER_REDESIGN.md and 20_latent_degeneracy.py.
+#
+# Set to False to reproduce every result obtained before the extension.
+EXTENDED_FEATURES = True
+
+BASE_FEATURES = ["Vth", "IDSS", "RON", "gmmax", "IDLeak", "IGLeak"]
+# Curve-shape features, in the order 22_build_extended_dataset.py appends them.
+CURVE_FEATURES = ["SS_lin", "SS_sat", "gm_fwhm_sat", "DIBL", "V_knee",
+                  "V_gmpeak_sat"]
+
+FEATURES = BASE_FEATURES + CURVE_FEATURES if EXTENDED_FEATURES else list(BASE_FEATURES)
+FEATURE_DIM = len(FEATURES)   # 6 or 12
+
+# Width of the per-device static vector x0 (initial absolute parameter values).
+# This is NOT FEATURE_DIM: x0 comes from the six measured scalars and does not
+# grow when curve-shape observables are added, because those are defined
+# relative to the t=0 sweep and so carry no independent initial value.
+# DeviceAlphaNet consumes [x0_static, T_norm], so it must size itself from
+# this, not from FEATURE_DIM -- otherwise the extended run builds a 13-wide
+# input layer and is handed 7.
+X0_STATIC_DIM = len(BASE_FEATURES)   # 6
 
 # Degradation transformation epsilon to avoid log(0)
 EPSILON = 1e-9
@@ -75,8 +106,9 @@ CELSIUS_TO_KELVIN = 273.15
 # Model architecture
 # ---------------------------------------------------------------------------
 # Encoder (GRU)
-# Input = [x(6), feature_mask(6), T_norm, log_t, delta_log_t] -> 15
-ENCODER_INPUT_DIM = FEATURE_DIM * 2 + 3   # 15
+# Input = [x(F), feature_mask(F), T_norm, log_t, delta_log_t]
+# -> 15 with the base 6 features, 27 with the extended 12.
+ENCODER_INPUT_DIM = FEATURE_DIM * 2 + 3   # 15 (base) / 27 (extended)
 GRU_HIDDEN_DIM = 16
 GRU_NUM_LAYERS = 2
 
@@ -84,14 +116,70 @@ GRU_NUM_LAYERS = 2
 # Sparsity mask — rows = features (x1..x6), columns = latent (zG,zB,zM,zL,zC)
 # 1 = connection allowed, 0 = forced zero
 #                     zG  zB  zM  zL  zC
-DECODER_SPARSITY = [
-    [1,  1,  1,  0,  1],   # x1: Vth      ← zG, zB, zM, zC
-    [1,  1,  1,  0,  1],   # x2: IDSS     ← zG, zB, zM, zC
-    [1,  1,  1,  0,  1],   # x3: RON      ← zG, zB, zM, zC
-    [1,  1,  1,  0,  1],   # x4: gmmax    ← zG, zB, zM, zC
-    [0,  1,  0,  1,  0],   # x5: IDLeak   ← zB, zL
-    [1,  0,  0,  1,  0],   # x6: IGLeak   ← zG, zL
+_BASE_SPARSITY = [
+    [1,  1,  1,  0,  1],   # x1: Vth      <- zG, zB, zM, zC
+    [1,  1,  1,  0,  1],   # x2: IDSS     <- zG, zB, zM, zC
+    [1,  1,  1,  0,  1],   # x3: RON      <- zG, zB, zM, zC
+    [1,  1,  1,  0,  1],   # x4: gmmax    <- zG, zB, zM, zC
+    [0,  1,  0,  1,  0],   # x5: IDLeak   <- zB, zL
+    [1,  0,  0,  1,  0],   # x6: IGLeak   <- zG, zL
 ]
+
+# Curve-shape rows. These exist to give each latent an observable of its own,
+# the way the leakage rows already do for zL -- which is why zL is the only
+# latent that stays identifiable in the 6-feature model (substitutability
+# residual 56 %, versus 1.7 % for zB and zM).
+#
+# Note the four base rows above are deliberately left identical to each other,
+# so results stay comparable with earlier runs. Their degeneracy is broken
+# INDIRECTLY: the rows below pin zG/zB/zM to distinct signatures, so the
+# optimiser can no longer permute the latents without paying a cost here.
+#
+# zL stays confined to the leakage rows, which is what has kept it the one
+# identifiable latent in the 6-feature model.
+#                     zG  zB  zM  zL  zC
+# zC is deliberately EXCLUDED from every curve row (its column is 0 below).
+# It is admitted into the four base rows only, where cumulative damage is
+# genuinely one of several contributors.
+#
+# Why: zC entering nearly every row gives the optimiser a near-null direction
+# it can inflate without bound. An unregularised least-squares fit of this
+# decoder to the data ran away to weights of +-5e5 along zG = -zC, and with
+# ridge damping zC still shared its signal with zG (substitutability 30 % and
+# 25 %). Tested five zC connection patterns by direct fit; removing zC from
+# all six curve rows was the clear winner:
+#
+#   variant                      resid   eff.rank    zG     zB     zM
+#   zC everywhere (first draft)  0.199      1.337   25.2   59.3   92.2
+#   zC on damage rows only       0.248      1.094    7.6   38.3    7.6
+#   zC off all curve rows  <--   0.276      1.682   98.4   33.5   88.8
+#   zC minimal                   0.242      1.072   13.2   48.7   11.8
+#
+# The residual is slightly worse (0.276 vs 0.199) because zC was absorbing
+# variance it had no business explaining; the identifiability gain is the
+# point. zG goes from 25 % to 98 % non-substitutable.
+#                     zG  zB  zM  zL  zC
+_CURVE_SPARSITY = [
+    [1,  0,  0,  0,  0],   # SS_lin       <- zG only: subthreshold swing is set
+                           #    by interface-state density. A trap that merely
+                           #    FILLS shifts Vth and leaves SS alone; a trap
+                           #    that is CREATED degrades SS. Cleanest separator
+                           #    available (drift +0.244, within-(T,t) CV 1.36).
+    [1,  1,  0,  0,  0],   # SS_sat       <- zG, zB: same probe under drain
+                           #    bias, which adds buffer-depletion sensitivity.
+    [0,  0,  1,  0,  0],   # gm_fwhm_sat  <- zM only: mobility loss lowers AND
+                           #    broadens the gm curve, while a pure threshold
+                           #    shift translates it without changing its width.
+    [0,  1,  0,  0,  0],   # DIBL         <- zB only: drain-induced barrier
+                           #    lowering is governed by buffer confinement.
+    [0,  1,  1,  0,  0],   # V_knee       <- zB, zM: the knee moves out when
+                           #    access resistance grows or the buffer traps up.
+    [1,  0,  1,  0,  0],   # V_gmpeak_sat <- zG, zM: peak POSITION is the
+                           #    rigid-shift counterpart to the width above.
+]
+
+DECODER_SPARSITY = (_BASE_SPARSITY + _CURVE_SPARSITY if EXTENDED_FEATURES
+                    else _BASE_SPARSITY)
 
 # Rows that allow negative weights in the decoder
 # x1 (Vth): sign can be either direction depending on trap polarity
@@ -105,6 +193,13 @@ FREE_SIGN_ROWS = [
     IDLEAK_DECODER_ROW,
     IGLEAK_DECODER_ROW,
 ]
+if EXTENDED_FEATURES:
+    # V_gmpeak_sat tracks the threshold, whose direction depends on trap
+    # polarity, so it needs a free sign for the same reason Vth does -- and it
+    # is observed to reverse: -0.042 relative at 10 h, +0.042 at 1000 h.
+    # SS_lin/SS_sat (interface states only worsen the swing), gm_fwhm_sat,
+    # DIBL and V_knee all move one way with stress and stay non-negative.
+    FREE_SIGN_ROWS = FREE_SIGN_ROWS + [FEATURES.index("V_gmpeak_sat")]
 # Allow signed weights only for the reversible branch columns of leakage rows
 # while keeping zL weights non-negative in the monotone leakage channel.
 FREE_SIGN_DECODER_COLUMNS = {

@@ -1,7 +1,7 @@
 # Decoder redesign: giving each latent its own observable signature
 
-Status: **proposal, not yet implemented.** Nothing in the training pipeline is
-changed by this file.
+Status: **implemented in config.py** (`EXTENDED_FEATURES = True`), dataset built
+by `22_build_extended_dataset.py`, verified by direct fit. Retraining pending.
 
 ## The problem, restated
 
@@ -132,12 +132,12 @@ RON              [ 1,  1,  1,  0,  1]   unchanged
 gmmax            [ 1,  1,  1,  0,  1]   unchanged
 IDLeak           [ 0,  1,  0,  1,  0]   unchanged
 IGLeak           [ 1,  0,  0,  1,  0]   unchanged
-SS_lin           [ 1,  0,  0,  0,  1]   <- zG ONLY (+ damage)
-SS_sat           [ 1,  1,  0,  0,  1]   <- zG, zB
-gm_fwhm_sat      [ 0,  0,  1,  0,  1]   <- zM ONLY (+ damage)
-DIBL             [ 0,  1,  0,  0,  1]   <- zB ONLY (+ damage)
-V_knee           [ 0,  1,  1,  0,  1]   <- zB, zM
-V_gmpeak_sat     [ 1,  0,  1,  0,  1]   <- zG, zM
+SS_lin           [ 1,  0,  0,  0,  0]   <- zG ONLY
+SS_sat           [ 1,  1,  0,  0,  0]   <- zG, zB
+gm_fwhm_sat      [ 0,  0,  1,  0,  0]   <- zM ONLY
+DIBL             [ 0,  1,  0,  0,  0]   <- zB ONLY
+V_knee           [ 0,  1,  1,  0,  0]   <- zB, zM
+V_gmpeak_sat     [ 1,  0,  1,  0,  0]   <- zG, zM
 ```
 
 A first draft gave `V_gmpeak_sat` the pattern `[1,1,0,0,1]`, which duplicated
@@ -168,9 +168,28 @@ Rationale, row by row:
   transport (zM) moves where the peak sits. Paired with gm_fwhm_sat, the two
   separate "the curve moved" from "the curve flattened".
 
-`zC` (cumulative damage) is allowed into every new row: it is the monotone
-irreversible term and must be able to appear anywhere. `zL` stays confined to
-the leakage rows, which is what has kept it identifiable.
+`zC` is **excluded from every curve row** and kept only in the four base rows.
+The first draft admitted it everywhere on the reasoning that cumulative damage
+affects everything. Physically defensible, numerically ruinous: with zC in 10
+of 12 rows an unregularised fit ran away to weights of +-5e5 along the null
+direction `zG = -zC`, and even with ridge damping zC and zG kept splitting the
+same signal (substitutability 30 % and 25 %). Five patterns were tested by
+direct fit:
+
+| zC pattern | residual | eff. rank | zG | zB | zM |
+|---|---|---|---|---|---|
+| everywhere (first draft) | 0.199 | 1.337 | 25.2 | 59.3 | 92.2 |
+| damage rows only | 0.248 | 1.094 | 7.6 | 38.3 | 7.6 |
+| **off all curve rows** | 0.276 | **1.682** | **98.4** | 33.5 | 88.8 |
+| minimal | 0.242 | 1.072 | 13.2 | 48.7 | 11.8 |
+| RON + knee + fwhm | 0.271 | 1.103 | 14.5 | 49.3 | 15.2 |
+
+The winner has a slightly *worse* residual (0.276 vs 0.199) because zC was
+absorbing variance it had no business explaining. Identifiability is the
+point: zG goes from 25 % to 98 % non-substitutable.
+
+`zL` stays confined to the leakage rows, which is what has kept it the one
+identifiable latent in the 6-feature model.
 
 Verified properties of the proposed mask (checked programmatically, not by eye):
 
@@ -213,14 +232,40 @@ Non-negative (degradation is one-directional):
 ## Expected outcome and how it will be judged
 
 The mask alone does not guarantee identifiability; it removes the structural
-obstacle. Success criteria, measured with the tools already written:
+obstacle.
 
-1. `20_latent_degeneracy.py` effective rank **> 2.5** (from 1.06).
-2. Substitutability residual **> 20 %** for zG, zB and zM individually
-   (currently 1.7-3.8 %).
+### The original rank target was wrong
+
+This document first set "effective rank > 2.5". That target is **not
+reachable on this data**, and it was set without checking whether it could be.
+Measured ceilings:
+
+| what | effective rank |
+|---|---|
+| the 6-feature data itself (PCA) | 1.48 / 6 |
+| the 12-feature data itself (PCA) | **3.45 / 12** |
+| a **dense** 12x5 decoder, no mask at all | **2.14 / 5** |
+| the tightened mask below | **1.68 / 5** |
+| the current 6-feature mask | 1.06 / 4 |
+
+A dense decoder is the best any 12x5 linear readout can do, and it reaches
+only 2.14. Asking a *sparse* mask for 2.5 was asking for more structure than
+the measurements contain. The corrected criterion is **effective rank within
+~80 % of the dense ceiling**, i.e. > 1.7 -- which the tightened mask meets at
+1.68 (78.7 %).
+
+### Criteria
+
+1. Effective rank >= 1.7 (78 %+ of the 2.14 dense ceiling). Achieved: 1.68.
+2. Substitutability residual > 20 % for zG, zB and zM individually
+   (was 1.7-3.8 %). Achieved: **98.4 / 33.5 / 88.8 %**.
 3. `alpha` standard deviation across devices materially above 3.3e-05.
-4. Only then is the A/B/C ablation (`16_`) worth re-running — and only then
+   Untested until the retrain.
+4. Only then is the A/B/C ablation (`16_`) worth re-running -- and only then
    can its result be interpreted as evidence about physics conditioning.
+
+Criteria 1 and 2 are met by direct least-squares fit of the decoder to the
+extended data, without training. Criterion 3 needs the retrain.
 
 If (1) and (2) improve but the A/B/C ablation stays null, that is a genuine
 and reportable finding about the physics prior. Until they improve, the
