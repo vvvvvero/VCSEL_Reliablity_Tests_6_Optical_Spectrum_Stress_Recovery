@@ -255,7 +255,10 @@ def bounds_loss(z: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 # Indices of monotone states in the latent vector [zG, zB, zM, zL, zC]
-MONOTONE_IDX = [2, 3, 4]   # zM, zL, zC
+# Derived from cfg so it tracks LATENT_NAMES: inserting the fast mode zF at
+# index 2 shifted zM/zL/zC from [2,3,4] to [3,4,5]. Hard-coding it here would
+# have applied the monotonicity penalty to the fast REVERSIBLE mode instead.
+MONOTONE_IDX = cfg.MONOTONE_IDX   # zM, zL, zC
 
 
 def monotonicity_loss(

@@ -3,10 +3,11 @@
 ====================
 Physics-informed Latent ODE system for GaN HEMT thermal-storage degradation.
 
-5 Effective Latent States
+6 Effective Latent States
 --------------------------
   zG  –  Gate / interface effective trap occupancy fraction              [0,1]
   zB  –  Buffer / access-region effective trap occupancy fraction        [0,1]
+  zF  –  Fast reversible trap mode (initial filling / thermal transient)  [0,1]
   zM  –  Channel transport degradation                                    [0,1]  (monotone)
   zL  –  Leakage-path degradation                                         [0,1]  (monotone)
   zC  –  Cumulative irreversible structural damage                        [0,1]  (monotone)
@@ -97,6 +98,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import config as cfg
+
+# Number of leading latent states advanced by the exact exponential update in
+# the IMEX split. These MUST be the first N_FAST columns of z and must all be
+# linear relaxation modes of the form dz/dt = a(1-z) - b*z: zG, zB, zF.
+# The remaining states (zM, zL, zC) are nonlinear and go through RK4.
+N_FAST = cfg.N_FAST_LATENTS
 
 ARRHENIUS_EXP_CLAMP = 15.0
 RHS_CLAMP = 50.0
@@ -222,6 +229,21 @@ class PhysicsODE(nn.Module):
         self.kBe_raw = nn.Parameter(torch.tensor(-3.5))
         self.gammaB_raw = nn.Parameter(torch.tensor(-3.0))
 
+        # FAST reversible trap mode zF (same SRH form, much shorter tau).
+        #
+        # Initialised at rate ~1.0 /h (tau ~ 1 h) rather than the ~0.18 /h of
+        # zG/zB, because the observables it must explain are already 57-64 %
+        # complete at the first measurement point (1 h): SS_lin needs
+        # tau = 1.19 h, gm_fwhm_sat tau = 0.98 h. The trained zG/zB both sit
+        # at tau = 5.3 h and are also carrying the slow 1-2000 h evolution, so
+        # neither can supply this without abandoning its own role.
+        #
+        # softplus(0.55) = 1.0, softplus(-0.4) = 0.51 -> rate = 1.51 /h,
+        # tau = 0.66 h at T_ref, leaving room to relax either way.
+        self.kFc_raw = nn.Parameter(torch.tensor(0.55))
+        self.kFe_raw = nn.Parameter(torch.tensor(-0.4))
+        self.gammaF_raw = nn.Parameter(torch.tensor(-3.0))
+
         # Channel transport degradation
         self.kM_raw  = nn.Parameter(torch.tensor(-4.0))
         self.wMG_raw = nn.Parameter(torch.tensor(0.0))    # mixing weight
@@ -272,6 +294,28 @@ class PhysicsODE(nn.Module):
     def gammaB(self) -> torch.Tensor:
         """SRH minority-carrier correction weight for zB, >= 0."""
         return _sp(self.gammaB_raw)
+
+    @property
+    def kFc(self) -> torch.Tensor:
+        return _sp(self.kFc_raw)
+
+    @property
+    def kFe(self) -> torch.Tensor:
+        return _sp(self.kFe_raw)
+
+    @property
+    def gammaF(self) -> torch.Tensor:
+        return _sp(self.gammaF_raw)
+
+    @property
+    def zF_equilibrium(self) -> torch.Tensor:
+        """SRH-implied equilibrium occupancy of the fast mode, kFc/(kFc+kFe)."""
+        return self.kFc / (self.kFc + self.kFe).clamp(min=1e-12)
+
+    @property
+    def tau_F_hours(self) -> torch.Tensor:
+        """Relaxation time of the fast mode at T_ref, in hours (reported)."""
+        return 1.0 / ((self.kFc + self.kFe) * (1.0 + self.gammaF)).clamp(min=1e-12)
 
     @property
     def kM(self) -> torch.Tensor:
@@ -370,13 +414,13 @@ class PhysicsODE(nn.Module):
         observed/encoder trajectories without re-deriving the RHS.
 
         Args:
-            z : (B, 5)  [zG, zB, zM, zL, zC]
+            z : (B, 6)  [zG, zB, zF, zM, zL, zC]
         Returns:
             (driving_M, driving_L) : each (B, 1)
         """
         zG = z[:, 0:1]
         zB = z[:, 1:2]
-        zC = z[:, 4:5]
+        zC = z[:, 5:6]
         driving_M = self.wMG * zG + self.wMB * zB + zC
         driving_L = self.aLG * zG + self.aLB * zB + zC
         return driving_M, driving_L
@@ -389,12 +433,12 @@ class PhysicsODE(nn.Module):
         Compute dz/dt for the 5-state system.
 
         Args:
-            z            : (B, 5)  current latent state [zG, zB, zM, zL, zC]
+            z            : (B, 6)  current latent state [zG, zB, zF, zM, zL, zC]
             T_K          : (B,)    temperature [K]
             device_alpha : (B,)    per-device rate multiplier for zC (≥ 0)
 
         Returns:
-            dzdt         : (B, 5)
+            dzdt         : (B, 6)
         """
         T_K = T_K.view(-1, 1)                       # (B,1)
         device_alpha = device_alpha.view(-1, 1)
@@ -404,9 +448,10 @@ class PhysicsODE(nn.Module):
 
         zG = z[:, 0:1]
         zB = z[:, 1:2]
-        zM = z[:, 2:3]
-        zL = z[:, 3:4]
-        zC = z[:, 4:5]
+        zF = z[:, 2:3]
+        zM = z[:, 3:4]
+        zL = z[:, 4:5]
+        zC = z[:, 5:6]
 
         # dzG/dt  — SRH occupancy kinetics: majority-carrier capture/emission
         # scaled by (1 + gammaG) to fold in the minority-carrier contribution
@@ -434,6 +479,12 @@ class PhysicsODE(nn.Module):
         srh_B = self.kBc * frev * (1.0 - zB) - self.kBe * frev * zB
         dzB = srh_B + self.gammaB * srh_B.detach()
 
+        # dzF/dt  — same SRH structure as zG/zB, but a much shorter tau. This
+        # is the initial trap-filling / thermal-transient response that is
+        # already largely complete by the first measurement point.
+        srh_F = self.kFc * frev * (1.0 - zF) - self.kFe * frev * zF
+        dzF = srh_F + self.gammaF * srh_F.detach()
+
         # dzM/dt  (monotone increasing: driven by trap occupancy + cumulative)
         driving_M, driving_L = self.driving_forces(z)
         dzM = self.kM * firrev * driving_M * (1.0 - zM)
@@ -444,7 +495,7 @@ class PhysicsODE(nn.Module):
         # dzC/dt  (monotone increasing: slower approach to saturation)
         dzC = self.kC * device_alpha * firrev * (1.0 - zC) ** 2
 
-        dzdt = torch.cat([dzG, dzB, dzM, dzL, dzC], dim=1)  # (B,5)
+        dzdt = torch.cat([dzG, dzB, dzF, dzM, dzL, dzC], dim=1)  # (B,6)
         return dzdt
 
     # ------------------------------------------------------------------
@@ -461,14 +512,14 @@ class PhysicsODE(nn.Module):
         Integrate the ODE from t to t + dt_h using fixed-step RK4.
 
         Args:
-            z0           : (B, 5)  initial state
+            z0           : (B, 6)  initial state
             T_K          : (B,)    temperature [K]
             dt_h         : (B,)    integration interval [hours]
             device_alpha : (B,)    per-device rate multiplier
             n_substeps   : number of RK4 substeps; auto-computed if None
 
         Returns:
-            z_end        : (B, 5)
+            z_end        : (B, 6)
         """
         if n_substeps is None:
             # Heuristic: 10 substeps per log-decade of dt
@@ -505,24 +556,32 @@ class PhysicsODE(nn.Module):
     # ------------------------------------------------------------------
 
     def _fast_mode_coeffs(self, T_K: torch.Tensor):
-        """Return (a_G, b_G, a_B, b_B), the linear capture/emission rates of
-        the fast trap-occupancy modes at temperature T_K, each shaped (B,1).
+        """Linear capture/emission rates of the three fast modes at T_K.
 
-        dzG/dt = a_G*(1 - zG) - b_G*zG   (and analogously for zB)
+        Returns (a_G, b_G, a_B, b_B, a_F, b_F), each (B,1), where
 
-        The (1 + gamma) SRH minority-carrier correction is a plain scalar
-        multiplier on the whole expression (see rhs()), so it folds into both
-        rates identically and does not change the linear structure.
+            dz/dt = a*(1 - z) - b*z
+
+        for z in (zG, zB, zF). The (1 + gamma) SRH minority-carrier correction
+        is a plain scalar multiplier on the whole expression (see rhs()), so it
+        folds into both rates identically and does not change the linear
+        structure -- which is what lets these three be advanced exactly.
+
+        zF shares the form but not the scale: it is initialised ~8x faster, to
+        cover the jump the observables show before the first measurement.
         """
         T_K = T_K.view(-1, 1)
         frev = self._arrhenius(self.Ea_rev, T_K)          # (B,1)
         gG = 1.0 + self.gammaG
         gB = 1.0 + self.gammaB
+        gF = 1.0 + self.gammaF
         a_G = self.kGc * frev * gG
         b_G = self.kGe * frev * gG
         a_B = self.kBc * frev * gB
         b_B = self.kBe * frev * gB
-        return a_G, b_G, a_B, b_B
+        a_F = self.kFc * frev * gF
+        b_F = self.kFe * frev * gF
+        return a_G, b_G, a_B, b_B, a_F, b_F
 
     def _exact_fast_update(self, z_fast, a, b, dt):
         """Closed-form solution of dz/dt = a*(1-z) - b*z over an interval dt.
@@ -574,17 +633,20 @@ class PhysicsODE(nn.Module):
         z = z0
         sub_dt = (dt_h / n_substeps).unsqueeze(1)   # (B,1)
         half_dt = 0.5 * sub_dt
-        a_G, b_G, a_B, b_B = self._fast_mode_coeffs(T_K)
+        a_G, b_G, a_B, b_B, a_F, b_F = self._fast_mode_coeffs(T_K)
 
         def slow_rhs(z_in):
             full = self._sanitize_rhs(self.rhs(z_in, T_K, device_alpha))
-            # zero out the fast components: they are handled exactly, below
-            return torch.cat([torch.zeros_like(full[:, :2]), full[:, 2:]], dim=1)
+            # zero out the fast components (zG, zB, zF): handled exactly below
+            return torch.cat([torch.zeros_like(full[:, :N_FAST]),
+                              full[:, N_FAST:]], dim=1)
 
         def advance_fast(z_in, dt):
             zG = self._exact_fast_update(z_in[:, 0:1], a_G, b_G, dt)
             zB = self._exact_fast_update(z_in[:, 1:2], a_B, b_B, dt)
-            return self._sanitize_state(torch.cat([zG, zB, z_in[:, 2:]], dim=1))
+            zF = self._exact_fast_update(z_in[:, 2:3], a_F, b_F, dt)
+            return self._sanitize_state(
+                torch.cat([zG, zB, zF, z_in[:, N_FAST:]], dim=1))
 
         for _ in range(n_substeps):
             # Strang splitting: half fast -> full slow -> half fast.
@@ -623,13 +685,13 @@ class PhysicsODE(nn.Module):
         observation times.
 
         Args:
-            z0         : (B, 5)   initial latent state
+            z0         : (B, 6)   initial latent state
             T_K        : (B,)     temperature [K]
             times_h    : (B, T)   observation times [h]; first column = t0
             device_alpha: (B,)    per-device rate multiplier
 
         Returns:
-            z_traj     : (B, T, 5)   latent states at each time point
+            z_traj     : (B, T, 6)   latent states at each time point
         """
         B, T = times_h.shape
         z_traj = [z0.unsqueeze(1)]         # (B,1,5)
@@ -642,7 +704,7 @@ class PhysicsODE(nn.Module):
             z_traj.append(z_next.unsqueeze(1))
             z_curr = z_next
 
-        return torch.cat(z_traj, dim=1)   # (B, T, 5)
+        return torch.cat(z_traj, dim=1)   # (B, T, 6)
 
     # ------------------------------------------------------------------
     # Utility: ODE residual  (used in loss computation)
@@ -667,7 +729,7 @@ class PhysicsODE(nn.Module):
                 Longer-horizon behavior is still handled elsewhere through rollout.
 
         Args:
-            z_enc      : (B, T, 5)  encoder latent outputs (after sigmoid)
+            z_enc      : (B, T, 6)  encoder latent outputs (after sigmoid)
             T_K        : (B,)
             times_h    : (B, T)
             device_alpha: (B,)
@@ -686,7 +748,7 @@ class PhysicsODE(nn.Module):
             if not valid.any():
                 continue
 
-            z_prev  = z_enc[valid, step - 1, :].detach()    # (Bv, 5)
+            z_prev  = z_enc[valid, step - 1, :].detach()    # (Bv, 6)
             z_curr  = z_enc[valid, step, :].detach()        # (Bv, 5)
             T_K_v   = T_K[valid]
             dt_v    = (times_h[valid, step] - times_h[valid, step - 1]).clamp(min=cfg.ODE_MIN_DT_H)

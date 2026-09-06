@@ -923,7 +923,7 @@ def _generative_val_score(
     bounds_v_list = []
     for s in range(S):
         z = z_fakes[s]                    # (N, T, 5)
-        for mi in [2, 3, 4]:              # zM, zL, zC
+        for mi in cfg.MONOTONE_IDX:       # zM, zL, zC (see cfg.LATENT_NAMES)
             d = z[:, 1:, mi] - z[:, :-1, mi]
             mono_v_list.append(float(np.mean(d < -1e-4)))
         bounds_v_list.append(float(np.mean((z < 0.0) | (z > 1.0))))

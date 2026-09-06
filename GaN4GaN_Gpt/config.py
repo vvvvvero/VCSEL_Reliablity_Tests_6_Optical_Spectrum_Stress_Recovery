@@ -92,8 +92,37 @@ LEAKAGE_LOG_CLIP = 6.0
 # Physics / latent space
 # ---------------------------------------------------------------------------
 # Latent state names and ordering  [zG, zB, zM, zL, zC]
-LATENT_NAMES = ["zG", "zB", "zM", "zL", "zC"]
-LATENT_DIM = 5
+# zF is a FAST reversible trap mode (index 2, kept adjacent to zG/zB so the
+# IMEX integrator's fast block stays contiguous).
+#
+# Why it exists: the curve-shape observables are already 57-64 % of the way to
+# their 2000 h value at the FIRST measurement (1 h) -- SS_lin 57 %,
+# gm_fwhm_sat 64 %. Reproducing that needs tau ~ 1 h, but the trained zG and
+# zB both sit at tau ~ 5.3 h and must also carry the slow 1-2000 h evolution.
+# One relaxation mode cannot be both. Without zF the optimiser would push
+# kGc up to chase the jump, saturating zG within the first step and turning
+# it into a constant over the rest of the horizon -- reintroducing the
+# degeneracy in a new form.
+#
+# Physically this is the initial trap filling / thermal-transient response,
+# which for GaN storage tests occurs on seconds-to-minutes timescales, i.e.
+# faster than the first measurement point. The ramp-up/cool-down duration for
+# this dataset is not documented, so zF's time constant is LEARNED rather
+# than fixed.
+LATENT_NAMES = ["zG", "zB", "zF", "zM", "zL", "zC"]
+LATENT_DIM = 6
+
+# Indices of the MONOTONE (irreversible) latents. Derived from LATENT_NAMES
+# rather than written out, because inserting zF at index 2 shifted zM/zL/zC
+# from [2,3,4] to [3,4,5]; several modules had that list hard-coded and would
+# otherwise have silently forced the fast REVERSIBLE mode to be monotone.
+MONOTONE_LATENTS = ["zM", "zL", "zC"]
+MONOTONE_IDX = [LATENT_NAMES.index(n) for n in MONOTONE_LATENTS]   # [3, 4, 5]
+
+# Leading latents advanced exactly by the IMEX integrator's exponential step.
+# They must be the FIRST states and all linear relaxation modes.
+FAST_LATENTS = ["zG", "zB", "zF"]
+N_FAST_LATENTS = len(FAST_LATENTS)
 
 # Physical constants
 KB_EV = 8.617333e-5     # Boltzmann constant [eV/K]
@@ -116,13 +145,14 @@ GRU_NUM_LAYERS = 2
 # Sparsity mask — rows = features (x1..x6), columns = latent (zG,zB,zM,zL,zC)
 # 1 = connection allowed, 0 = forced zero
 #                     zG  zB  zM  zL  zC
+#                     zG  zB  zF  zM  zL  zC
 _BASE_SPARSITY = [
-    [1,  1,  1,  0,  1],   # x1: Vth      <- zG, zB, zM, zC
-    [1,  1,  1,  0,  1],   # x2: IDSS     <- zG, zB, zM, zC
-    [1,  1,  1,  0,  1],   # x3: RON      <- zG, zB, zM, zC
-    [1,  1,  1,  0,  1],   # x4: gmmax    <- zG, zB, zM, zC
-    [0,  1,  0,  1,  0],   # x5: IDLeak   <- zB, zL
-    [1,  0,  0,  1,  0],   # x6: IGLeak   <- zG, zL
+    [1,  1,  0,  1,  0,  1],   # x1: Vth      <- zG, zB, zM, zC
+    [1,  1,  0,  1,  0,  1],   # x2: IDSS     <- zG, zB, zM, zC
+    [1,  1,  0,  1,  0,  1],   # x3: RON      <- zG, zB, zM, zC
+    [1,  1,  0,  1,  0,  1],   # x4: gmmax    <- zG, zB, zM, zC
+    [0,  1,  0,  0,  1,  0],   # x5: IDLeak   <- zB, zL
+    [1,  0,  0,  0,  1,  0],   # x6: IGLeak   <- zG, zL
 ]
 
 # Curve-shape rows. These exist to give each latent an observable of its own,
@@ -158,23 +188,27 @@ _BASE_SPARSITY = [
 # The residual is slightly worse (0.276 vs 0.199) because zC was absorbing
 # variance it had no business explaining; the identifiability gain is the
 # point. zG goes from 25 % to 98 % non-substitutable.
-#                     zG  zB  zM  zL  zC
+# zF is wired ONLY into the curve rows that actually jump within the first
+# measurement: SS_lin (57 % complete at 1 h) and gm_fwhm_sat (64 %). SS_sat
+# (23 %) and DIBL (22 %) evolve slowly enough for zG/zB alone, so admitting zF
+# there would just hand the optimiser a second redundant fast direction.
+#                     zG  zB  zF  zM  zL  zC
 _CURVE_SPARSITY = [
-    [1,  0,  0,  0,  0],   # SS_lin       <- zG only: subthreshold swing is set
+    [1,  0,  1,  0,  0,  0],   # SS_lin       <- zG + zF: subthreshold swing is set
                            #    by interface-state density. A trap that merely
                            #    FILLS shifts Vth and leaves SS alone; a trap
                            #    that is CREATED degrades SS. Cleanest separator
                            #    available (drift +0.244, within-(T,t) CV 1.36).
-    [1,  1,  0,  0,  0],   # SS_sat       <- zG, zB: same probe under drain
+    [1,  1,  0,  0,  0,  0],   # SS_sat       <- zG, zB: same probe under drain
                            #    bias, which adds buffer-depletion sensitivity.
-    [0,  0,  1,  0,  0],   # gm_fwhm_sat  <- zM only: mobility loss lowers AND
+    [0,  0,  1,  1,  0,  0],   # gm_fwhm_sat  <- zF + zM: mobility loss lowers AND
                            #    broadens the gm curve, while a pure threshold
                            #    shift translates it without changing its width.
-    [0,  1,  0,  0,  0],   # DIBL         <- zB only: drain-induced barrier
+    [0,  1,  0,  0,  0,  0],   # DIBL         <- zB only: drain-induced barrier
                            #    lowering is governed by buffer confinement.
-    [0,  1,  1,  0,  0],   # V_knee       <- zB, zM: the knee moves out when
+    [0,  1,  0,  1,  0,  0],   # V_knee       <- zB, zM: the knee moves out when
                            #    access resistance grows or the buffer traps up.
-    [1,  0,  1,  0,  0],   # V_gmpeak_sat <- zG, zM: peak POSITION is the
+    [1,  0,  0,  1,  0,  0],   # V_gmpeak_sat <- zG, zM: peak POSITION is the
                            #    rigid-shift counterpart to the width above.
 ]
 

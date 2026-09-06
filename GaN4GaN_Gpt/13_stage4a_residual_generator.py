@@ -368,7 +368,7 @@ def monotone_latent_penalty(
 
     Loss: mean(relu(z_prefix_last[mono] - z_perturbed[mono]))^2
     """
-    mono_idx = [2, 3, 4]  # zM, zL, zC
+    mono_idx = cfg.MONOTONE_IDX  # zM, zL, zC
     z_ref  = z_prefix_last[:, mono_idx]
     z_pert = z_perturbed[:, mono_idx]
     decrease = torch.relu(z_ref - z_pert)  # positive when pert decreases mono state

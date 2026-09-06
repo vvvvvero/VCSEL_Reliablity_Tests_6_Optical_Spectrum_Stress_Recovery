@@ -1056,7 +1056,7 @@ def compute_freeze_zc_ablation(
 
 def _monotone_violation_rate(z_traj: np.ndarray, mask: np.ndarray) -> float:
     """Compute monotone violation rate for zM/zL/zC on valid adjacent steps."""
-    mono_idx = [2, 3, 4]
+    mono_idx = cfg.MONOTONE_IDX
     violations = 0
     pairs = 0
     _, T, _ = z_traj.shape
