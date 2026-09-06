@@ -595,10 +595,33 @@ def counterfactual_temperature_consistency(model, generator, eval_cache, device,
     """For each cached device, re-run the generator with the SAME z_phys/x0/
     prefix but T swept over {275, 300, 325} C (holding everything else fixed).
 
-    A generator that has learned meaningful physics conditioning should
-    produce ensemble-mean residual magnitude / rho that responds monotonically
-    to temperature (higher T -> typically faster/larger degradation), same
-    direction as the backbone's Arrhenius behaviour. We report:
+    WARNING -- frac_monotone_275_300_325 IS NOT A VALID METRIC. Do not report
+    it. See MONOTONICITY_ANOMALY.md. Three independent defects:
+
+      1. Its premise is false. It rewards a residual that RISES with T, but
+         the measured residual dips at 300 C (0.1002 / 0.0655 / 0.2093 at
+         548 / 573 / 598 K) -- a U shape, because 300 C is T_REF_K where the
+         Arrhenius factors are 1 and the ODE is best conditioned. A generator
+         that reproduces the real profile is scored WRONG; one emitting a
+         bland monotone ramp is scored RIGHT. Measured shape correlation with
+         the real profile: A_full -0.70, B_no_physics +0.97 -- i.e. the metric
+         ranks last the condition that best captures the falling limb.
+      2. It scores |ensemble MEAN|, which is ~0 by construction for a
+         well-centred generator. All conditions land at ~0.015 across every
+         temperature, an order of magnitude below the real residual, varying
+         a few percent over a 50 C span.
+      3. tol=1e-4 against differences of order 1e-3 makes each device a
+         near-coin-flip, which is why the statistic swings between 0.000 and
+         0.407 across runs whose CRPSS differs by ~3 %.
+
+    Prefer: correlation of the generated per-temperature profile against the
+    MEASURED one, the ensemble SPREAD (deltas.std, which is O(0.1) and is what
+    Arrhenius scaling actually predicts), or the learned Ea_sigma compared
+    with GaN literature.
+
+    The original (unsound) rationale was: a generator that has learned
+    meaningful physics conditioning should produce ensemble-mean residual
+    magnitude / rho that responds monotonically to temperature. We report:
       - frac_monotone: fraction of devices where mean |residual| increases
         (or at least does not decrease beyond tolerance) from 275->300->325C.
       - mean_abs_resid_by_T: average generated |residual| ensemble mean at
@@ -642,6 +665,9 @@ def counterfactual_temperature_consistency(model, generator, eval_cache, device,
             n_total += monotone.shape[0]
 
     return {
+        # INVALID -- see the warning in this function's docstring and
+        # MONOTONICITY_ANOMALY.md. Retained only so previously saved artefacts
+        # stay loadable; never report it.
         "frac_monotone_275_300_325": float(n_monotone / max(n_total, 1)),
         "mean_abs_resid_275C": float(np.mean(per_temp_mean_abs[275.0])) if per_temp_mean_abs[275.0] else float("nan"),
         "mean_abs_resid_300C": float(np.mean(per_temp_mean_abs[300.0])) if per_temp_mean_abs[300.0] else float("nan"),
