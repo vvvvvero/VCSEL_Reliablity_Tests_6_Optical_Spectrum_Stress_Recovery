@@ -88,10 +88,26 @@ DEFAULT_LOG_SCALE_FLOOR_INIT = -2.6
 _LEAKAGE_FEAT_INDICES = [cfg.IDLEAK_DECODER_ROW, cfg.IGLEAK_DECODER_ROW]  # [4, 5]
 _LEAKAGE_BIAS_BOUND = 0.30  # tanh-bounded: max |bias| in normalised space
 
-# Stable features: those used in Stage 4C / Stage 5 adversarial training.
-# IDLeak (4) and IGLeak (5) are EXCLUDED from the generator and discriminator;
-# Stage 3 deterministic predictions are used as auxiliary outputs for them.
-STABLE_FEAT_INDICES = [0, 1, 2, 3]   # Vth, IDSS, RON, gmmax
+# Features the Stage 4C generator / Stage 5 discriminator model.
+#
+# In the 6-feature model IDLeak (4) and IGLeak (5) had essentially zero
+# residual variance -- the decoder could not move them -- so generating them
+# was meaningless and they were excluded, with Stage 3's deterministic
+# prediction used as an auxiliary output instead.
+#
+# On the 11-feature / 6-latent model that is no longer true: measured residual
+# spreads are Vth 0.268, IDSS 0.927, RON 0.337, gmmax 0.409, IDLeak 0.327,
+# IGLeak 0.397, SS_lin 0.107, SS_sat 0.122, gm_fwhm_sat 0.073, DIBL 0.104,
+# V_gmpeak_sat 0.126. Every feature now carries residual structure worth
+# modelling, so all of them are generated.
+#
+# NOTE this changes what CRPSS / coverage / W1 are averaged over, so these
+# metrics are NOT comparable with the 6-feature runs. Set EXTENDED_FEATURES
+# to False in config.py to reproduce the old definition.
+if getattr(cfg, "EXTENDED_FEATURES", False):
+    STABLE_FEAT_INDICES = list(range(cfg.FEATURE_DIM))
+else:
+    STABLE_FEAT_INDICES = [0, 1, 2, 3]   # Vth, IDSS, RON, gmmax
 N_STABLE_FEATURES   = len(STABLE_FEAT_INDICES)
 
 
@@ -327,7 +343,24 @@ LAMBDA_ARRHENIUS_TREND = 0.0   # default off; set > 0 to activate Arrhenius sigm
 # sigma values) avoids that failure mode: the MLP stays fully free to fit
 # per-device sigma, only the batch-averaged cross-temperature-group ratio
 # is nudged towards physical plausibility.
-ARRHENIUS_TREND_EA_REF = {0: 0.67, 1: 0.35, 2: 0.20, 3: 0.35}   # feature index -> Ea [eV]
+# feature index -> reference Ea [eV]. Only the four original features have a
+# value; features absent from this dict are simply skipped by the loss.
+#
+# Deliberately NOT extended to the curve features. Fitting Ea from the
+# residual spread across the three temperatures gives numbers, but the spread
+# is not monotone in T for several features (RON: 0.541, 0.098, 0.174 at
+# 548/573/598 K), so a two-parameter Arrhenius fit through three
+# non-monotone points mostly encodes the 598 K outlier rather than an
+# activation energy. Constraining sigma(T) towards such a value would inject
+# that artefact as a prior. The four existing values were validated
+# separately and are kept.
+ARRHENIUS_TREND_EA_REF = {0: 0.67, 1: 0.35, 2: 0.20, 3: 0.35}
+
+# Starting Ea for a generated feature with no validated reference value. 0.35 eV
+# is the middle of the four measured ones; it is only an INITIALISATION -- the
+# Arrhenius-sigma generator learns Ea_sigma per feature, and the trend loss
+# constrains only the features listed in ARRHENIUS_TREND_EA_REF above.
+EA_SIGMA_DEFAULT = 0.35
 
 
 def arrhenius_trend_loss(
@@ -724,7 +757,7 @@ class AR1GuidedResidualGeneratorStable(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
 
     def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
-        """Return (rho, sigma) tensors shaped (B, 4) for the 4 stable features."""
+        """Return (rho, sigma) tensors shaped (B, n_output), one per generated feature."""
         z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
         x0            = torch.nan_to_num(x0,            nan=0.0, posinf=0.0, neginf=0.0)
         T_K           = torch.nan_to_num(T_K,           nan=0.0, posinf=0.0, neginf=0.0)
@@ -905,7 +938,7 @@ class AR1GuidedResidualGeneratorPhysGated(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
 
     def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
-        """Return (rho, sigma) tensors shaped (B, 4) for the 4 stable features."""
+        """Return (rho, sigma) tensors shaped (B, n_output), one per generated feature."""
         z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
         x0            = torch.nan_to_num(x0,            nan=0.0, posinf=0.0, neginf=0.0)
         T_K           = torch.nan_to_num(T_K,           nan=0.0, posinf=0.0, neginf=0.0)
@@ -1043,11 +1076,14 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         latent_dim:            int   = cfg.LATENT_DIM,
         n_context_feat:        int   = cfg.FEATURE_DIM,
         sigma_ref_init:        float = 0.08,
-        # Ea_sigma init values per stable feature [Vth, IDSS, RON, gmmax],
-        # seeded from the robustified per-temperature-bucket fit on this
-        # dataset (see docstring); training can move these, this is only a
-        # sane starting point in the physically-plausible 0.1-1 eV range.
-        ea_sigma_init:         tuple = (0.67, 0.35, 0.20, 0.35),
+        # Per-feature Ea_sigma initialisation. None (the default) builds a
+        # length-n_output list from ARRHENIUS_TREND_EA_REF, falling back to
+        # EA_SIGMA_DEFAULT for features with no validated reference value.
+        # The four original entries were seeded from the robustified
+        # per-temperature-bucket fit on this dataset (see docstring); training
+        # can move them, this is only a starting point in the physically
+        # plausible 0.1-1 eV range.
+        ea_sigma_init:         tuple = None,
         correction_bound:      float = 0.5,   # max +-50% multiplicative deviation from Arrhenius baseline
     ):
         super().__init__()
@@ -1068,7 +1104,7 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2 * n_output),   # [rho_raw(4), sigma_correction_raw(4)]
+            nn.Linear(hidden_dim, 2 * n_output),   # [rho_raw, sigma_correction_raw]
         )
         for m in self.net:
             if isinstance(m, nn.Linear):
@@ -1082,7 +1118,22 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         # Ea_sigma similarly via exp(log_Ea_sigma) (same convention as
         # PhysicsODE.Ea_rev/Ea_irrev in 02_physics_latent.py).
         self.log_sigma_ref = nn.Parameter(torch.log(torch.full((n_output,), float(sigma_ref_init))))
-        ea_init_t = torch.tensor(ea_sigma_init[:n_output], dtype=torch.float32)
+        # One Ea per generated feature. Previously a fixed 4-tuple sliced by
+        # [:n_output], which SILENTLY produced a length-4 parameter when
+        # n_output was larger -- log_sigma_ref (11) and log_Ea_sigma (4) then
+        # broadcast-clashed only later, inside _arrhenius_sigma. Build it to
+        # length n_output explicitly, taking any known reference Ea per
+        # feature index and a neutral default for the rest.
+        if ea_sigma_init is None:
+            ea_list = [float(ARRHENIUS_TREND_EA_REF.get(i, EA_SIGMA_DEFAULT))
+                       for i in range(n_output)]
+        else:
+            ea_list = [float(v) for v in ea_sigma_init]
+            if len(ea_list) < n_output:
+                ea_list += [EA_SIGMA_DEFAULT] * (n_output - len(ea_list))
+            ea_list = ea_list[:n_output]
+        ea_init_t = torch.tensor(ea_list, dtype=torch.float32)
+        assert ea_init_t.numel() == n_output, (ea_init_t.numel(), n_output)
         self.log_Ea_sigma = nn.Parameter(torch.log(ea_init_t.clamp(min=0.05)))
 
     @property
@@ -1104,7 +1155,7 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         return self.sigma_ref.unsqueeze(0) * torch.exp(exponent)
 
     def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
-        """Return (rho, sigma) tensors shaped (B, 4) for the 4 stable features."""
+        """Return (rho, sigma) tensors shaped (B, n_output), one per generated feature."""
         z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
         x0            = torch.nan_to_num(x0,            nan=0.0, posinf=0.0, neginf=0.0)
         T_K           = torch.nan_to_num(T_K,           nan=0.0, posinf=0.0, neginf=0.0)
