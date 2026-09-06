@@ -100,6 +100,11 @@ def _load_all():
     return mods
 
 
+# Stage 4C module, loaded at import time so the generator class below can take
+# its feature set from the single source of truth rather than repeating it.
+_s4b_mod = _load_module("_abl_s4b_featdef", "14_stage4b_ar1_guided_generator.py")
+
+
 # ---------------------------------------------------------------------------
 # A/B/C-conditioned generator (extends Stage4C's stable-feature architecture)
 # ---------------------------------------------------------------------------
@@ -112,7 +117,7 @@ class PhysicsConditionGeneratorStable(nn.Module):
     a drop-in replacement for train_stage4b / evaluate_stage4b / Stage 5), but
     the context vector construction is parameterised by `condition_mode`:
 
-      "full"     : context = [z_phys(5), Δz_phys(5), T_norm(1), x0(6), log_t(1)] = 18
+      "full"     : context = [z_phys, Δz_phys, T_norm(1), x0, log_t(1)]
       "none"     : same layout, but z_phys and Δz_phys are zeroed out before
                    the network sees them (so no gradient path from physics
                    latents reaches the loss).
@@ -122,8 +127,15 @@ class PhysicsConditionGeneratorStable(nn.Module):
                    device's actual T/t/x0/targets.
     """
 
-    STABLE_INDICES = [0, 1, 2, 3]   # Vth, IDSS, RON, gmmax
-    N_STABLE = 4
+    # Which features this generator models. Taken from the Stage 4C module so
+    # the ablation always scores the SAME feature set Stage 4C was trained and
+    # calibrated on. Hard-coding [0,1,2,3] here meant that after the
+    # observation set grew to 11 the ablation silently kept generating only the
+    # four original features, so its coverage (0.33) was not comparable with
+    # Stage 4C's (0.86) and the A/B/C comparison was run on a different model
+    # than the one under study.
+    STABLE_INDICES = list(_s4b_mod.STABLE_FEAT_INDICES)
+    N_STABLE = len(STABLE_INDICES)
     LOG10_T_REF = 0.35
 
     def __init__(
@@ -131,13 +143,15 @@ class PhysicsConditionGeneratorStable(nn.Module):
         condition_mode: str = "full",
         noise_dim: int = 16,
         hidden_dim: int = 96,
-        n_output: int = 4,
+        n_output: int = None,
         latent_dim: int = cfg.LATENT_DIM,
         n_context_feat: int = cfg.FEATURE_DIM,
         log_scale_floor_init: float = -2.6,
     ):
         super().__init__()
         assert condition_mode in ("full", "none", "shuffled")
+        if n_output is None:
+            n_output = self.N_STABLE
         self.condition_mode = condition_mode
         self.noise_dim = noise_dim
         self.n_features = n_output
