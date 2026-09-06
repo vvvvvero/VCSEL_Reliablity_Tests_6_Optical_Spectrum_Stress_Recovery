@@ -1,7 +1,6 @@
 # Decoder redesign: giving each latent its own observable signature
 
-Status: **implemented in config.py** (`EXTENDED_FEATURES = True`), dataset built
-by `22_build_extended_dataset.py`, verified by direct fit. Retraining pending.
+Status: **implemented and retrained.** All three criteria met; results below.
 
 ## The problem, restated
 
@@ -294,3 +293,66 @@ is empty".
 
 Step 3 is the one with real design content — the existing `-log(P/P_0)`
 transform assumes a positive quantity and is wrong for the signed features.
+
+
+---
+
+## Retrain results (Stage 1-3, 11 features / 6 latents, 5 h 46 m)
+
+Checkpoints in `output/pi_timegan/ext11/`; the 6-feature baselines are untouched.
+
+| criterion | target | baseline | achieved |
+|---|---|---|---|
+| 1. decoder effective rank | >= 1.7 | 1.06 | **2.33 / 6** |
+| 2. substitutability, every latent | > 20 % | 1.7-3.8 % | **54-98 %** |
+| 3. alpha spread | >> 3.3e-05 | 3.3e-05 | **1.07e-01** |
+
+Substitutability per latent: zG 54.2, zB 62.5, zF 80.3, zM 58.1, zL 97.8,
+zC 54.3 %. No latent is anywhere near the degenerate range that motivated
+this work, and the fitted rank (2.33) came out slightly above the 2.27
+predicted by the pre-training least-squares check.
+
+**alpha is finally alive.** It spans 0.501-1.997, i.e. 99.7 % of its
+permitted range, with 137/203 distinct values — against a baseline where all
+170 devices sat pinned at the lower bound. The 6-feature model could not
+identify a per-device rate because every latent could stand in for every
+other; with mechanism-specific observables it can.
+
+**zF learned to stay fast**: tau = 0.57 h, against zG 4.78 h and zB 3.33 h.
+It was initialised at 0.63 h and the data kept it there rather than letting it
+drift into the slow modes, which is evidence that the early jump is real and
+separable rather than an artefact of the initialisation.
+
+Activation energies remain physically sensible: Ea_rev 0.348 eV,
+Ea_irrev 0.651 eV.
+
+### Forecast accuracy
+
+Scored on the four original features only, so it is comparable with the
+6-feature baseline:
+
+| | baseline | ext11 |
+|---|---|---|
+| test RMSE (Vth, IDSS, RON, gmmax) | 0.2429 | **0.2404** |
+| Stage 3 val rollout MSE | 0.03111 | **0.02848** |
+
+Accuracy is essentially unchanged (-1.0 %), which is the expected and
+acceptable outcome: the goal was identifiability, not error reduction, and
+the model now predicts eleven quantities instead of six for the same cost.
+The new features are predicted well in their own right (SS_lin 0.110,
+gm_fwhm_sat 0.071, DIBL 0.111).
+
+### What did not change
+
+* Train RMSE 0.674 still far exceeds test 0.240 — the model remains
+  underfit, so capacity is not the binding constraint.
+* 598 K is still the hard case: RMSE 0.365 against 0.140 / 0.146 at the two
+  lower temperatures. A single `Ea_irrev` covering the whole range is the
+  most likely cause and is untouched by this work.
+
+### Next
+
+The A/B/C physics-conditioning ablation can now be re-run and, for the first
+time, interpreted: the physics channel carries per-device information, so a
+null result would be evidence about the prior rather than about an empty
+channel.
