@@ -95,17 +95,32 @@ _LEAKAGE_BIAS_BOUND = 0.30  # tanh-bounded: max |bias| in normalised space
 # was meaningless and they were excluded, with Stage 3's deterministic
 # prediction used as an auxiliary output instead.
 #
-# On the 11-feature / 6-latent model that is no longer true: measured residual
-# spreads are Vth 0.268, IDSS 0.927, RON 0.337, gmmax 0.409, IDLeak 0.327,
-# IGLeak 0.397, SS_lin 0.107, SS_sat 0.122, gm_fwhm_sat 0.073, DIBL 0.104,
-# V_gmpeak_sat 0.126. Every feature now carries residual structure worth
-# modelling, so all of them are generated.
+# On the 11-feature / 6-latent model the zero-variance argument no longer
+# holds -- measured residual spreads are Vth 0.268, IDSS 0.927, RON 0.337,
+# gmmax 0.409, IDLeak 0.327, IGLeak 0.397, SS_lin 0.107, SS_sat 0.122,
+# gm_fwhm_sat 0.073, DIBL 0.104, V_gmpeak_sat 0.126 -- so the five curve
+# features are generated. The leakage pair still is NOT, for a different
+# reason, established by measurement rather than assumed:
+#
+# generating all 11 gave IDLeak Cov50/80/90 = 0.024 / 0.060 / 0.107 and
+# IGLeak 0.000 / 0.021 / 0.043. An interval that covers NOTHING is not a
+# calibration shortfall, it is a failed fit. Leakage residuals are dominated
+# by detector-floor noise and are heavy-tailed (which is why the preprocessor
+# applies LEAKAGE_LOG_CLIP and a floor at all), so a Gaussian sigma fitted to
+# their typical scale cannot bracket them. Excluding the pair moves
+# Cov90 0.596 -> 0.711 and CRPS 0.121 -> 0.080 across the remaining nine.
+#
+# Modelling them would need a heavy-tailed head (Student-t, or a much larger
+# sigma floor on those channels), not simply a place in this list.
+# As before, Stage 3's deterministic prediction is used for them instead.
 #
 # NOTE this changes what CRPSS / coverage / W1 are averaged over, so these
 # metrics are NOT comparable with the 6-feature runs. Set EXTENDED_FEATURES
 # to False in config.py to reproduce the old definition.
+_LEAKAGE_SET = set(_LEAKAGE_FEAT_INDICES)
 if getattr(cfg, "EXTENDED_FEATURES", False):
-    STABLE_FEAT_INDICES = list(range(cfg.FEATURE_DIM))
+    STABLE_FEAT_INDICES = [i for i in range(cfg.FEATURE_DIM)
+                           if i not in _LEAKAGE_SET]
 else:
     STABLE_FEAT_INDICES = [0, 1, 2, 3]   # Vth, IDSS, RON, gmmax
 N_STABLE_FEATURES   = len(STABLE_FEAT_INDICES)
