@@ -1,8 +1,9 @@
 """
 22_build_extended_dataset.py
 ============================
-Merge the six curve-shape features from 21_iv_curve_features.py into the
-existing processed dataset, producing a 12-feature observation tensor.
+Merge the five retained curve-shape features from 21_iv_curve_features.py
+into the existing processed dataset, producing an 11-feature observation
+tensor.
 
 Why a separate script instead of editing 01_data_preprocessing.py
 ------------------------------------------------------------------
@@ -25,7 +26,6 @@ assumes a strictly positive quantity, so it cannot be reused blindly:
 
   SS_lin, SS_sat   positive, increase with damage   -> +log(SS/SS0)
   gm_fwhm_sat      positive, increases              -> +log(W/W0)
-  V_knee           positive, increases              -> +log(V/V0)
   DIBL             SIGNED voltage, crosses zero     -> (D - D0) / scale
   V_gmpeak_sat     SIGNED voltage, crosses zero     -> (V - V0) / scale
 
@@ -67,15 +67,19 @@ import config as cfg
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 
-# New feature columns, in the order they are appended after the original six.
+# New feature columns, appended after the original six. Must stay in sync
+# with cfg.CURVE_FEATURES.
 # "log"  -> +log(v / v0)          positive quantity that grows with damage
 # "diff" -> (v - v0) / scale      signed quantity; scale from the train split
+# V_knee is deliberately absent: the IDVD sweep steps VD in 0.1 V, so the knee
+# takes only 83 distinct values, 22 % of devices move by exactly zero, and the
+# median drift is +0.000 from 10 h to 1000 h. It is quantised by the
+# measurement grid, not resolving degradation.
 NEW_FEATURES = [
     ("SS_lin",       "log"),
     ("SS_sat",       "log"),
     ("gm_fwhm_sat",  "log"),
     ("DIBL",         "diff"),
-    ("V_knee",       "log"),
     ("V_gmpeak_sat", "diff"),
 ]
 
@@ -107,7 +111,7 @@ def build_lookup(records: List[Dict]) -> Dict[str, Dict[float, Dict]]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build the 12-feature dataset")
+    ap = argparse.ArgumentParser(description="Build the extended-feature dataset")
     ap.add_argument("--iv-features", default=os.path.join(cfg.OUTPUT_PATH,
                                                           "iv_curve_features.pkl"))
     ap.add_argument("--source", default=cfg.PROCESSED_DATA_PATH,

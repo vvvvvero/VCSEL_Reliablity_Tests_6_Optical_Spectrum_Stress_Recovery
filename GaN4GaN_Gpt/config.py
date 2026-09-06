@@ -62,8 +62,13 @@ EXTENDED_FEATURES = True
 
 BASE_FEATURES = ["Vth", "IDSS", "RON", "gmmax", "IDLeak", "IGLeak"]
 # Curve-shape features, in the order 22_build_extended_dataset.py appends them.
-CURVE_FEATURES = ["SS_lin", "SS_sat", "gm_fwhm_sat", "DIBL", "V_knee",
-                  "V_gmpeak_sat"]
+# V_knee was extracted and evaluated, then dropped: the IDVD sweep steps VD in
+# 0.1 V, so the knee lands on only 83 distinct values and 22 % of devices show
+# a change of EXACTLY zero against their t=0 baseline, with a median drift of
+# +0.000 from 10 h to 1000 h. It is quantised by the measurement grid rather
+# than resolving degradation -- the same defect that excluded gm_fwhm_lin.
+# 21_iv_curve_features.py still extracts it for interpretation.
+CURVE_FEATURES = ["SS_lin", "SS_sat", "gm_fwhm_sat", "DIBL", "V_gmpeak_sat"]
 
 FEATURES = BASE_FEATURES + CURVE_FEATURES if EXTENDED_FEATURES else list(BASE_FEATURES)
 FEATURE_DIM = len(FEATURES)   # 6 or 12
@@ -206,8 +211,6 @@ _CURVE_SPARSITY = [
                            #    shift translates it without changing its width.
     [0,  1,  0,  0,  0,  0],   # DIBL         <- zB only: drain-induced barrier
                            #    lowering is governed by buffer confinement.
-    [0,  1,  0,  1,  0,  0],   # V_knee       <- zB, zM: the knee moves out when
-                           #    access resistance grows or the buffer traps up.
     [1,  0,  0,  1,  0,  0],   # V_gmpeak_sat <- zG, zM: peak POSITION is the
                            #    rigid-shift counterpart to the width above.
 ]

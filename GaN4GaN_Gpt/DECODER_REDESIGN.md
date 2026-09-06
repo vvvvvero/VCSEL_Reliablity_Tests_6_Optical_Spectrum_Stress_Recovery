@@ -95,6 +95,14 @@ property `alpha` needs and never had.
   drifts only 3.7-7 % and separates devices at CV = 0.044, an order of magnitude
   below the SS features. Kept in the extracted set for interpretation, but **not
   given a latent to drive**; on this evidence it would be a near-constant row.
+* **`V_knee`** — proposed and then removed. The same quantisation defect as
+  `gm_fwhm_lin`, which this document had checked for one feature but not the
+  other: the IDVD sweep steps VD in 0.1 V, so the knee takes only 83 distinct
+  values, 22 % of devices move by *exactly* zero against their baseline, and the
+  median drift is +0.000 from 10 h through 1000 h. Removing it **improved**
+  every identifiability measure (effective rank 1.68 -> 2.27 on 6 latents,
+  zB 33.5 -> 37.1 %, zM 88.8 -> 43.4 % but from a mask that now also carries
+  zF), confirming it had been contributing a near-empty degree of freedom.
 
 Leakage note: `IGS_leak`/`IDS_leak` are *signed* currents (99.7 % negative,
 crossing zero), so the relative drift of -15 in the trend table is an artefact
