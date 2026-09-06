@@ -102,7 +102,7 @@ of dividing by a near-zero signed baseline, not a real 1500 % change. If used
 they must enter as `log10|I|`, which is what the existing pipeline already does
 for IDLeak/IGLeak.
 
-## Proposed observable set (10 rows)
+## Proposed observable set (12 rows)
 
 Keeps the four existing main-channel features so results stay comparable to
 every previous run, and adds six curve-shape rows.
@@ -163,8 +163,10 @@ Rationale, row by row:
   buffer confines the channel — a direct buffer-trap probe.
 * **V_knee ← zB, zM.** The knee moves out when access resistance grows
   (zM) or when the buffer traps up (zB).
-* **V_gmpeak_sat ← zG, zB.** The *position* of the gm peak is the rigid-shift
-  counterpart to gm_fwhm: it responds to charged traps, not to mobility.
+* **V_gmpeak_sat ← zG, zM.** The *position* of the gm peak is the rigid-shift
+  counterpart to gm_fwhm's width: charged traps (zG) translate the curve, and
+  transport (zM) moves where the peak sits. Paired with gm_fwhm_sat, the two
+  separate "the curve moved" from "the curve flattened".
 
 `zC` (cumulative damage) is allowed into every new row: it is the monotone
 irreversible term and must be able to appear anywhere. `zL` stays confined to
