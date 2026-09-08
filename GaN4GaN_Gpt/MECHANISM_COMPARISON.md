@@ -1,4 +1,4 @@
-# Candidate rate-law comparison — first attempt INVALID; re-run pending
+# Candidate rate-law comparison — SRH leads; not yet converged
 
 ## What was attempted
 
@@ -129,9 +129,68 @@ are now buffers rather than parameters:
 | log | 18 (was 21) |
 | power, stretched | 21 |
 
-## Status
+## Re-run with exact updates
 
-The invalid RK4 results are archived under `results/mechanism_candidates/rk4_invalid/`
-rather than deleted, so the failure stays inspectable. The re-run with the
-exact updates has not yet been completed — it was started and then paused.
-Nothing in this document may be cited until it has.
+40 epochs, one seed, everything but the reversible rate law held fixed.
+
+| candidate | params | val loss | test RMSE | t=500h | t=1000h | t=2000h |
+|---|---|---|---|---|---|---|
+| **srh** | 18 | **0.0455** | **0.2425** | 0.2051 | 0.2236 | 0.3016 |
+| stretched | 21 | 0.0791 | 0.3332 | 0.2529 | 0.3422 | 0.4503 |
+| power | 21 | 0.0861 | 0.3316 | 0.2540 | 0.4214 | 0.4266 |
+| log | 18 | 0.1305 | 0.4213 | 0.3507 | 0.4710 | 0.6065 |
+
+SRH leads on every horizon, with 3 fewer parameters than power and stretched.
+
+### The fix did what it was supposed to
+
+Comparing against the archived RK4 run isolates the integrator's effect. SRH is
+byte-identical, as expected — its path never used the RK4 that was broken:
+
+| candidate | val (RK4) | val (exact) | RMSE (RK4) | RMSE (exact) |
+|---|---|---|---|---|
+| srh | 0.04546 | 0.04546 | 0.2425 | 0.2425 |
+| power | 0.15304 | **0.08611** | 0.4226 | **0.3316** |
+| stretched | 0.10744 | **0.07914** | 0.3335 | 0.3332 |
+| log | 0.14833 | **0.13049** | 0.4903 | **0.4213** |
+
+Every alternative improved — power's validation loss nearly halved — which
+confirms the first comparison was measuring solver stability, not physics.
+All four now train properly: no early stops, val loss decreasing monotonically
+from epoch 1 through 40.
+
+### Why this still is not a finished result
+
+**Nothing converged.** Every candidate was still improving at epoch 40, and by
+a large margin:
+
+| candidate | ep1 | ep20 | ep40 | improvement over the last 20 epochs |
+|---|---|---|---|---|
+| srh | 0.1066 | 0.0579 | 0.0455 | 21.5 % |
+| stretched | 0.1247 | 0.0948 | 0.0791 | 16.5 % |
+| power | 0.1274 | 0.0986 | 0.0861 | 12.6 % |
+| log | 0.1725 | 0.1446 | 0.1305 | 9.8 % |
+
+A screening budget was chosen deliberately, but it means the ranking reflects
+40-epoch *learning speed* as much as final quality. SRH is also improving
+fastest, so the gap could widen or narrow with a full 200-epoch budget.
+
+**The exponents barely moved** — 0.009 to 0.019 from their initialisation of
+0.50 / 0.40 / 0.65. Gradients now reach them (1e-2 to 1e-3, verified), so this
+is not the earlier dead-parameter failure, but it does mean the fitted values
+carry little information and should not be quoted as measured GaN exponents.
+
+### What can be said
+
+Supported: with a matched budget, a matched solver class and honest parameter
+counts, **SRH fits this data better than power-law, stretched-exponential or
+logarithmic creep at 40 epochs**, and the ordering is consistent across every
+prediction horizon.
+
+Not yet supported: that SRH is the converged optimum, or that the fitted
+exponents estimate a physical quantity. A 200-epoch run of all four, plus a
+second seed, is needed before the claim goes in a paper — roughly 3 hours,
+since only SRH is slow.
+
+The invalid RK4 results stay archived under
+`results/mechanism_candidates/rk4_invalid/` so the failure remains inspectable.
