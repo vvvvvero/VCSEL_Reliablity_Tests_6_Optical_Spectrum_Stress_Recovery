@@ -62,15 +62,26 @@ NOISE_FLOOR_PCT = 2.7
 
 
 def load_runs(d: str) -> List[Dict]:
+    """Load per-run JSONs, skipping anything that is not one.
+
+    This script writes significance.json into the same directory, and that
+    file is a LIST of comparisons rather than a run dict -- reading it back on
+    a second invocation crashed with an unhelpful TypeError deep inside a
+    Counter. Validate the shape instead of trusting the extension.
+    """
     out = []
     for fn in sorted(os.listdir(d)):
         if not fn.endswith(".json"):
             continue
         try:
             with open(os.path.join(d, fn), encoding="utf-8") as f:
-                out.append(json.load(f))
+                obj = json.load(f)
         except Exception as exc:                       # noqa: BLE001
             log.warning("skipping %s: %s", fn, exc)
+            continue
+        if not isinstance(obj, dict) or "mode" not in obj or "test" not in obj:
+            continue                                   # not a run file
+        out.append(obj)
     return out
 
 

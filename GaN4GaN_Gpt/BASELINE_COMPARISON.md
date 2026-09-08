@@ -85,3 +85,40 @@ noise is present at that scale.
 Training time differs by ~30x (80 min vs 2.6 min) because the physics ODE uses
 the IMEX/RK4 driver with substeps. That is a cost of the method, not a
 confound for accuracy.
+
+
+---
+
+## Multi-seed confirmation (added after the single-seed sweep)
+
+Four seeds (42-45) on the main comparison, paired per seed. Physics wins
+**every seed of every pair**.
+
+| comparison | n | physics | baseline | relative | 95 % CI | verdict |
+|---|---|---|---|---|---|---|
+| vs Neural ODE | 4 | 0.2076 | 0.2397 | **-13.2 %** | [-16.3, -10.2] | physics better |
+| vs GRU | 4 | 0.2076 | 0.2713 | **-21.2 %** | [-34.1, -8.4] | physics better |
+| vs Neural ODE (OOD) | 2 | 0.6306 | 0.6436 | -2.0 % | [-2.1, -1.9] | below the 2.7 % noise floor |
+| vs GRU (OOD) | 2 | 0.6306 | 0.6751 | -6.4 % | [-10.8, -2.0] | physics better |
+
+Per-seed differences against the Neural ODE: -14.9, -9.9, -17.6, -10.6 %.
+Both main-comparison CIs exclude zero and clear the 2.7 % noise floor, so the
+headline claim is now supported by repetition rather than a single run.
+
+The OOD-vs-Neural-ODE result is the interesting one. Its CI is extremely
+tight ([-2.1, -1.9] %, d_z = -15.3) because both seeds agree almost exactly --
+but the effect is only 2 %, below the noise floor established elsewhere on
+this dataset. It is a *consistent* advantage that is also a *small* one, and
+it should be reported that way rather than as a win for Arrhenius
+extrapolation. Only 2 of 4 physics OOD seeds completed before the run was
+interrupted.
+
+Wilcoxon p is 0.125 for the 4-seed comparisons -- the smallest value
+attainable at n=4, so it reflects the sample size, not weak evidence. The CIs
+carry the argument here.
+
+**Reproducibility, an unplanned finding.** Across seeds the physics model
+returns 0.2040-0.2116 (spread 3.7 %), the Neural ODE 0.2264-0.2568 (13.4 %),
+and the GRU 0.2174-0.3257 (49.8 %). The constraint does not only lower the
+error, it makes training far more repeatable -- which for a reliability model
+is a claim in its own right.
