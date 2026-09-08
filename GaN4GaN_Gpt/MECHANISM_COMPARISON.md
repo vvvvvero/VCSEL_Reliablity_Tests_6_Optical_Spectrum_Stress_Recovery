@@ -1,4 +1,4 @@
-# Candidate rate-law comparison — INCONCLUSIVE, do not cite
+# Candidate rate-law comparison — first attempt INVALID; re-run pending
 
 ## What was attempted
 
@@ -75,3 +75,63 @@ be fitted stably under the current solver, so the pipeline's SRH assumption
 remains an assumption. The separately-measured result that the physics prior
 as a whole beats free-form dynamics (13.2 %, 4 seeds) is unaffected — it never
 depended on this comparison.
+
+
+---
+
+## The fix: every candidate has a closed-form solution
+
+The first attempt failed because the three time-dependent laws were integrated
+with an 8-substep RK4 whose backward pass produced gradients of 10^13-10^16.
+The remedy is not a better integrator — it is no integrator at all.
+
+All three candidates are **separable**:
+
+    dz/dt = k*f(t)*(1-z)   =>   z(t1) = 1 - (1-z(t0)) * exp(-k * [F(t1)-F(t0)])
+
+and F, the antiderivative of the rate shape, is analytic in every case:
+
+| candidate | rate shape f(t) | antiderivative F(t) |
+|---|---|---|
+| power, stretched | p·(t+t0)^(p-1) | (t+t0)^p |
+| log | 1/(1+t/t0) | t0·ln(1+t/t0) |
+
+Checked against 200k-point quadrature: agreement to **≤ 6e-11** on intervals
+from [0,1] h to [1000,2000] h. The stretched law's (1-z)^2 envelope integrates
+to a rational form, 1/(1-z1) = 1/(1-z0) + c·ΔF, which is also exact.
+
+This puts the candidates on the same footing as SRH, whose IMEX path was
+already an exact update — z1 = z_eq + (z0-z_eq)·exp(-(a+b)·dt). The comparison
+now differs only in the rate law, not in solver quality.
+
+**Measured effect on the gradients** (same batch, same initialisation):
+
+| candidate | before (RK4) | after (closed form) |
+|---|---|---|
+| power | 1.7e+16 | 1.3e-02 |
+| stretched | 2.0e+13 | 9.5e-03 |
+| log | 5.8e+03 | 7.2e-03 |
+| srh (control) | 6.7e-03 | 6.7e-03 |
+
+All now sit at SRH's order of magnitude, so the 5.0 gradient-norm clip no
+longer fires every step and the parameters can actually move.
+
+## A second unfairness, also fixed
+
+`log`'s three shape exponents received no gradient at all — its rate law,
+A/(t0+t), has no exponent to fit. They were nevertheless counted as
+parameters, making log look like a 21-parameter model against SRH's 18. They
+are now buffers rather than parameters:
+
+| candidate | trainable dynamics parameters |
+|---|---|
+| srh | 18 |
+| log | 18 (was 21) |
+| power, stretched | 21 |
+
+## Status
+
+The invalid RK4 results are archived under `results/mechanism_candidates/rk4_invalid/`
+rather than deleted, so the failure stays inspectable. The re-run with the
+exact updates has not yet been completed — it was started and then paused.
+Nothing in this document may be cited until it has.

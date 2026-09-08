@@ -94,6 +94,10 @@ T0_HOURS = 0.05
 # accelerates, which no degradation mechanism here should do.
 EXP_MIN, EXP_MAX = 0.05, 1.0
 
+# Cap on the exponent of the closed-form update, mirroring
+# ARRHENIUS_EXP_CLAMP in 02_physics_latent.py.
+ARR_CLAMP = 15.0
+
 
 def _load(alias: str, fname: str):
     path = os.path.join(BASE_DIR, fname)
@@ -130,9 +134,19 @@ def make_candidate_ode(ode_mod, candidate: str):
             def _inv(target):
                 p = (target - EXP_MIN) / (EXP_MAX - EXP_MIN)
                 return math.log(p / (1.0 - p))
-            self.expG_raw = nn.Parameter(torch.tensor(_inv(0.50)))
-            self.expB_raw = nn.Parameter(torch.tensor(_inv(0.40)))
-            self.expF_raw = nn.Parameter(torch.tensor(_inv(0.65)))
+            # The log law has no shape exponent -- its rate is A/(t0+t). An
+            # earlier version gave it three anyway; they received no gradient
+            # (verified: .grad is None) and inflated its parameter count from
+            # 18 to 21, so the comparison was not like-for-like. Registered as
+            # buffers there instead, so the count is honest and _exp still
+            # works unchanged.
+            if candidate == "log":
+                for n_, v in (("expG_raw", 0.50), ("expB_raw", 0.40), ("expF_raw", 0.65)):
+                    self.register_buffer(n_, torch.tensor(_inv(v)), persistent=False)
+            else:
+                self.expG_raw = nn.Parameter(torch.tensor(_inv(0.50)))
+                self.expB_raw = nn.Parameter(torch.tensor(_inv(0.40)))
+                self.expF_raw = nn.Parameter(torch.tensor(_inv(0.65)))
             # Elapsed-time clock, in hours, shaped (B,1). A buffer rather than
             # a parameter: it is state carried through a rollout, not
             # something to learn.
@@ -208,31 +222,105 @@ def make_candidate_ode(ode_mod, candidate: str):
             dzC = self.kC * device_alpha * firrev * (1.0 - zC) ** 2
             return torch.cat([dzG, dzB, dzF, dzM, dzL, dzC], dim=1)
 
-        def integrate(self, z0, T_K, dt_h, device_alpha, n_substeps=None):
-            """Plain RK4. The IMEX exponential update assumes a linear
-            autonomous relaxation, which these candidates are not."""
-            n = n_substeps or 8
-            z = z0
-            h = (dt_h / n).unsqueeze(1)
-            for _ in range(n):
-                k1 = self._sanitize_rhs(self.rhs(z, T_K, device_alpha))
-                k2 = self._sanitize_rhs(self.rhs(self._sanitize_state(z + 0.5 * h * k1), T_K, device_alpha))
-                k3 = self._sanitize_rhs(self.rhs(self._sanitize_state(z + 0.5 * h * k2), T_K, device_alpha))
-                k4 = self._sanitize_rhs(self.rhs(self._sanitize_state(z + h * k3), T_K, device_alpha))
-                z = self._sanitize_state(z + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4))
-                self.advance_clock(h.squeeze(1))
-            return z
+        def _shape_integral(self, t, exponent):
+            """Antiderivative of the rate shape f(t), evaluated at t.
+
+            Every candidate is SEPARABLE -- dz/dt = k*f(t)*(1-z) -- so the
+            interval update is exact once F(t) = INT f(t) dt is known:
+
+                z(t1) = 1 - (1 - z(t0)) * exp(-k * [F(t1) - F(t0)])
+
+            and F is analytic for all three:
+                power / stretched   INT p*(t+t0)^(p-1) dt = (t+t0)^p
+                log                 INT 1/(1+t/t0)    dt = t0*ln(1+t/t0)
+
+            Verified against 200k-point quadrature to <= 6e-11 over intervals
+            from [0,1] h to [1000,2000] h.
+            """
+            tt = (t + T0_HOURS).clamp(min=1e-12)
+            if candidate in ("power", "stretched"):
+                return torch.pow(tt, exponent)
+            return T0_HOURS * torch.log1p(t.clamp(min=0.0) / T0_HOURS)
+
+        def _exact_fast_step(self, z_prev, k, frev, t0, t1, exponent, order=1.0):
+            """Closed-form update of one fast state over [t0, t1].
+
+            order=1 for the (1-z) envelope (power, log); order=2 for the
+            stretched law, whose (1-z)^2 integrates to a rational form:
+                d z/dt = c*(1-z)^2  ->  1/(1-z1) = 1/(1-z0) + c*dF
+            """
+            dF = (self._shape_integral(t1, exponent)
+                  - self._shape_integral(t0, exponent)).clamp(min=0.0)
+            c = (k * frev * dF).clamp(max=ARR_CLAMP)
+            gap = (1.0 - z_prev).clamp(min=1e-6)
+            if order == 1.0:
+                return 1.0 - gap * torch.exp(-c)
+            return 1.0 - 1.0 / (1.0 / gap + c)
 
         def integrate_trajectory(self, z0, T_K, times_h, device_alpha):
+            """Exact per-interval update -- no substeps, no chained Jacobian.
+
+            Replaces an 8-substep RK4 rollout whose BACKWARD pass produced
+            gradients of 1e13-1e16 (measured), clipped every step and so
+            effectively random. The forward values were always bounded; the
+            blow-up came from compounding 88 chained steps. With the exact
+            solution there is one differentiable expression per interval.
+            """
             B, T = times_h.shape
-            self.reset_clock(B, z0.device, float(times_h[0, 0].item()) if T else 0.0)
+            TK = T_K.view(-1, 1)
+            frev = self._arrhenius(self.Ea_rev, TK)
+            firrev = self._arrhenius(self.Ea_irrev, TK)
+            alpha = device_alpha.view(-1, 1)
+            eG, eB, eF = (self._exp(self.expG_raw), self._exp(self.expB_raw),
+                          self._exp(self.expF_raw))
+            stretched = (candidate == "stretched")
+
             traj = [z0.unsqueeze(1)]
             z = z0
-            for t in range(1, T):
-                dt = (times_h[:, t] - times_h[:, t - 1]).clamp(min=0.0)
-                z = self.integrate(z, T_K, dt, device_alpha)
+            for i in range(1, T):
+                t0 = times_h[:, i - 1].view(-1, 1).clamp(min=0.0)
+                t1 = times_h[:, i].view(-1, 1).clamp(min=0.0)
+                dt = (t1 - t0).clamp(min=0.0)
+
+                zG = self._exact_fast_step(z[:, 0:1], self.kGc, frev, t0, t1, eG,
+                                           2.0 if stretched else 1.0)
+                zB = self._exact_fast_step(z[:, 1:2], self.kBc, frev, t0, t1, eB,
+                                           2.0 if stretched else 1.0)
+                zF = self._exact_fast_step(z[:, 2:3], self.kFc, frev, t0, t1, eF,
+                                           2.0 if stretched else 1.0)
+
+                # Irreversible states keep the base model's dynamics, advanced
+                # with the same RK4 the SRH model uses for them. They are held
+                # at the interval start while the fast block is updated, which
+                # is the Lie-Trotter split the base integrator already applies.
+                z_slow_in = torch.cat([z[:, 0:3], z[:, 3:6]], dim=1)
+                slow = self._slow_rk4(z_slow_in, TK, firrev, alpha, dt)
+                z = self._sanitize_state(torch.cat([zG, zB, zF, slow], dim=1))
                 traj.append(z.unsqueeze(1))
             return torch.cat(traj, dim=1)
+
+        def _slow_rk4(self, z, TK, firrev, alpha, dt, n=4):
+            """RK4 on zM, zL, zC only. Their time constants are far longer
+            than any step, so a few substeps suffice and the backward pass
+            stays short."""
+            h = (dt / n)
+            zs = z[:, 3:6]
+            def f(zfull):
+                zM, zL, zC = zfull[:, 3:4], zfull[:, 4:5], zfull[:, 5:6]
+                dM_, dL_ = self.driving_forces(zfull)
+                dzM = self.kM * firrev * dM_ * (1.0 - zM)
+                dzL = self.kL * firrev * (1.0 - zL) * dL_
+                dzC = self.kC * alpha * firrev * (1.0 - zC) ** 2
+                return torch.cat([dzM, dzL, dzC], dim=1)
+            for _ in range(n):
+                base3 = torch.cat([z[:, 0:3], zs], dim=1)
+                k1 = f(base3)
+                k2 = f(torch.cat([z[:, 0:3], zs + 0.5 * h * k1], dim=1))
+                k3 = f(torch.cat([z[:, 0:3], zs + 0.5 * h * k2], dim=1))
+                k4 = f(torch.cat([z[:, 0:3], zs + h * k3], dim=1))
+                zs = zs + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+                zs = zs.clamp(-0.2, 1.2)
+            return zs
 
     CandidateODE.__name__ = f"PhysicsODE_{candidate}"
     return CandidateODE
@@ -396,7 +484,7 @@ def main():
                "seed": args.seed, "minutes": mins, "n_dynamics_params": n_dyn,
                "val_loss": val, "test": res, "dataset": ds_path}
         # report learned exponents where the candidate has them
-        if hasattr(model.ode, "expG_raw"):
+        if hasattr(model.ode, "expG_raw") and cand != "log":
             out["exponents"] = {
                 n: float(model.ode._exp(getattr(model.ode, f"exp{n}_raw")))
                 for n in ("G", "B", "F")}
