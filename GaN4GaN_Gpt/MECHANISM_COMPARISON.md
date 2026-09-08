@@ -1,4 +1,4 @@
-# Candidate rate-law comparison — SRH leads; not yet converged
+# Candidate rate-law comparison — the data prefer SRH
 
 ## What was attempted
 
@@ -194,3 +194,76 @@ since only SRH is slow.
 
 The invalid RK4 results stay archived under
 `results/mechanism_candidates/rk4_invalid/` so the failure remains inspectable.
+
+
+---
+
+## Full budget: 200 epochs, two seeds
+
+The screen's caveat was that nothing had converged. Re-run at the full Stage-3
+budget with a second seed:
+
+| candidate | params | val (s42) | val (s43) | RMSE (s42) | RMSE (s43) | mean RMSE | vs SRH |
+|---|---|---|---|---|---|---|---|
+| **srh** | **18** | 0.02698 | 0.02751 | 0.2061 | 0.2040 | **0.2050** | — |
+| stretched | 21 | 0.04961 | 0.05008 | 0.2837 | 0.2943 | 0.2890 | **+41.0 %** |
+| power | 21 | 0.05587 | 0.05647 | 0.2929 | 0.2869 | 0.2899 | **+41.4 %** |
+| log | 18 | 0.09615 | 0.09452 | 0.3893 | 0.4200 | 0.4046 | +97.3 % |
+
+SRH wins on **every seed against every alternative**, by 41 % over the closest
+competitor and with 3 fewer parameters than power and stretched. Seed-to-seed
+spread within a candidate is ~1-3 %, an order of magnitude below the gaps
+between candidates, so the ranking is not a seed artefact. The margin is also
+15x this dataset's ~2.7 % noise floor.
+
+The SRH run reproduces the independently-trained Stage-3 model exactly
+(val 0.02698, RMSE 0.2061 for seed 42), confirming the harness introduces no
+drift.
+
+### Convergence
+
+Full budget shifted every number but not the order. SRH went from
+val 0.04546 / RMSE 0.2425 at 40 epochs to 0.02698 / 0.2061 at 200 — so the
+screen was indeed reading unconverged models, and the ranking would have been
+reported at inflated error had it stopped there.
+
+All four are still improving ~17-25 % over their last 100 epochs, so none is
+fully converged even now. That is a limit on the absolute numbers, not on the
+comparison: the improvement rates are close (SRH 24 %, stretched 21 %,
+power 22 %, log 17 %), so more budget would lower all four roughly together
+rather than reorder them. SRH improving *fastest* means additional epochs
+would, if anything, widen its lead.
+
+### The fitted exponents
+
+| candidate | seed | zG | zB | zF |
+|---|---|---|---|---|
+| power | 42 | 0.481 | 0.387 | 0.710 |
+| power | 43 | 0.475 | 0.384 | 0.710 |
+| stretched | 42 | 0.485 | 0.411 | 0.710 |
+| stretched | 43 | 0.473 | 0.407 | 0.707 |
+
+Now clearly displaced from their initialisation (0.50 / 0.40 / 0.65) and
+**reproducible across seeds to within 0.01**, unlike the screen where they had
+barely moved. The fast mode's exponent rises consistently to ~0.71 in both
+laws and both seeds.
+
+These remain fitted values of a *losing* model, so they should not be quoted
+as measured GaN dispersion exponents; their interest is that the alternatives
+were genuinely optimised, which is what makes the comparison fair.
+
+## Conclusion
+
+With a matched budget, matched solver class, honest parameter counts and two
+seeds, **the data prefer Shockley-Read-Hall kinetics over power-law,
+stretched-exponential and logarithmic-creep rate laws** — by 41 % in test RMSE
+over the closest alternative, consistently across seeds.
+
+This upgrades the pipeline's SRH choice from an assumption to a measurement,
+and complements the separate finding that the physics prior as a whole beats
+free-form dynamics by 13.2 % (4 seeds, CI [-16.3, -10.2]).
+
+Caveat for a write-up: two seeds support a 41 % gap comfortably, but the
+absolute RMSEs are not converged values, and the comparison covers the
+reversible trap states only — zM, zL and zC keep their saturating-drift form
+in every candidate and were never in dispute.
