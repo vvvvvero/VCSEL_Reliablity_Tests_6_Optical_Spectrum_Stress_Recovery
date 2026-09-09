@@ -846,6 +846,15 @@ class AR1GuidedResidualGeneratorStable(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
+        # Per-feature residual offset; see OFFSET_BOUND. Zero at init, so an
+        # untrained generator reproduces the pre-offset behaviour exactly.
+        self.offset_raw = nn.Parameter(torch.zeros(n_output))
+
+    @property
+    def offset(self) -> torch.Tensor:
+        """Learned per-feature residual offset, bounded to +-OFFSET_BOUND."""
+        return OFFSET_BOUND * torch.tanh(self.offset_raw)
+
     def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
         """Return (rho, sigma) tensors shaped (B, n_output), one per generated feature."""
         z_prefix_last = torch.nan_to_num(z_prefix_last, nan=0.5, posinf=0.0, neginf=0.0)
@@ -1030,6 +1039,15 @@ class AR1GuidedResidualGeneratorPhysGated(nn.Module):
                     nn.init.zeros_(m.bias)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+
+        # Per-feature residual offset; see OFFSET_BOUND. Zero at init, so an
+        # untrained generator reproduces the pre-offset behaviour exactly.
+        self.offset_raw = nn.Parameter(torch.zeros(n_output))
+
+    @property
+    def offset(self) -> torch.Tensor:
+        """Learned per-feature residual offset, bounded to +-OFFSET_BOUND."""
+        return OFFSET_BOUND * torch.tanh(self.offset_raw)
 
     def _context_params(self, z_prefix_last, T_K, x0, log_t_suffix, noise_init=None):
         """Return (rho, sigma) tensors shaped (B, n_output), one per generated feature."""

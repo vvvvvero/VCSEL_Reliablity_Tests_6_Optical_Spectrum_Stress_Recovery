@@ -116,3 +116,55 @@ The CV uses its own fold splits rather than the fixed train/val/test split, so
 its absolute CRPS (0.1136) is not comparable with the single-run test figure
 (0.0784); only the paired within-fold comparison is meaningful. Both analyses
 agree on direction, which is what matters.
+
+
+---
+
+## Re-tested after the generator fixes
+
+The comparison above was measured against a Stage 4C whose intervals were
+themselves too narrow (Cov90 0.8563 against a 0.90 target, and sigma_ref stuck
+at ~0.08 for every feature). Concluding that "Stage 5 harms calibration by
+narrowing intervals" from a baseline that was already under-covered is not a
+safe inference, so the CV was repeated after the per-feature offset and
+per-feature sigma_ref initialisation landed.
+
+**Stage 4C itself improved**, confirming the single-run result over 25 paired
+runs:
+
+| | before fixes | after fixes |
+|---|---|---|
+| Stage 4C CRPS | 0.1136 | 0.1096 |
+| Stage 4C Cov90 | 0.8656 | 0.8723 |
+| gap to 0.90 | +0.0344 | +0.0277 |
+
+**The Stage 5 verdict changed sign.**
+
+| | CRPS effect | p | Cohen's d | Cov90 |
+|---|---|---|---|---|
+| before fixes | Stage 5 **better** by 0.68 % | 0.0027 | 0.124 | 0.8656 → 0.8549 |
+| after fixes | Stage 5 **worse** by 0.28 % | 0.1128 | −0.064 | 0.8723 → 0.8572 |
+
+On the corrected baseline Stage 5's CRPS advantage disappears and reverses: the
+paired difference is now −0.00031 (95 % CI [−0.00061, −0.00001]), Wilcoxon
+p = 0.11, and Stage 5 is better on only 48.0 % of points. The earlier
+"significant" gain was an artefact of comparing against a mis-calibrated
+generator — once Stage 4C's intervals are the right width, the adversarial
+term has nothing left to add.
+
+What did **not** change is the calibration damage, which is the robust part of
+this result: Cov90 falls 1.7 % and the gap to nominal widens from +0.028 to
++0.043. Stage 5 narrows the predictive intervals in both settings.
+
+### Conclusion
+
+Adversarial fine-tuning does not help this model. Across two independent
+25-run CVs — one against an under-covered baseline, one against a corrected
+one — it never improves calibration, and its apparent CRPS benefit vanishes
+once the baseline it is measured against is itself sound. With a physics prior
+supplying the inductive bias and CRPS a proper scoring rule, the discriminator
+has no remaining work to do.
+
+This is now a negative result with the confounders removed: the conditioning
+channel carries per-device information (unlike the 2026-08-24 run), and the
+baseline is properly calibrated (unlike the first re-test).
