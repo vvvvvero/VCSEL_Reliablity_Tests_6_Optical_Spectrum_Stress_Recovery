@@ -464,6 +464,37 @@ SIGMA_REF_BY_FEATURE = {
 }
 SIGMA_REF_DEFAULT = 0.08
 
+# Whether sigma_ref should be re-derived from the CURRENT dataset with a robust
+# spread estimator rather than read from the table above.
+#
+# The table holds plain standard deviations, and those are inflated by a few
+# devices: measured sd/MAD ratios are IDSS 30.1x, DIBL 12.4x, RON 11.5x,
+# V_gmpeak 8.5x, gmmax 8.4x, and only IDLeak 1.3x / IGLeak 1.1x. IDSS at 30x
+# is why it over-covers (Cov90 0.9565) with an interval far wider than the
+# typical device needs. Dropping the three faulty devices only takes IDSS from
+# 0.903 to 0.655 against a MAD of 0.030, so device filtering alone does not
+# fix it.
+#
+# Left OFF until measured, and note that "robust" is NOT simply narrower --
+# computed on the filtered dataset it moves features in OPPOSITE directions
+# (table value / 1.5*MAD):
+#
+#   IDSS 20.8x   RON 6.0x   gmmax 3.9x    <- table too WIDE, robust narrows
+#   DIBL 0.8x    V_gmpeak 0.6x            <- about right
+#   Vth 0.4x     SS_lin 0.5x  SS_sat 0.5x <- table too NARROW, robust widens
+#   IDLeak 0.2x  IGLeak 0.2x              <- table far too narrow: robust
+#                                            widens these ~5x, which is close
+#                                            to the 4-5x shortfall measured
+#                                            when leakage under-covered
+#
+# So this is a re-scaling per feature, not a global shrink, and it may
+# incidentally address the leakage width problem. It still needs the same
+# before/after comparison every other width change got.
+SIGMA_REF_ROBUST = False
+# 1.4826 * MAD estimates the sd of a Gaussian; scale it up so the interval is
+# not set by the median device alone.
+SIGMA_ROBUST_SCALE = 1.5
+
 # --- interval-width fixes (both default OFF; see the leakage notes above) ---
 #
 # Measured on the sigma-initialised generator, two mechanisms leave the
