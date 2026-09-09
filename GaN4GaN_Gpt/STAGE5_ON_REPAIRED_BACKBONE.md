@@ -77,10 +77,42 @@ bias and CRPS supplying a proper scoring rule, **the adversarial term has no
 remaining work to do**. The discriminator is not being starved of information —
 it has information and still adds nothing.
 
+## Multi-seed confirmation (5 seeds x 5 folds, 25 paired runs)
+
+Each fold retrains both stages, so the spread reflects real training variation
+rather than evaluation noise.
+
+| | Stage 4C | Stage 5 |
+|---|---|---|
+| CRPS | 0.11365 | 0.11283 |
+| Cov90 | 0.8656 ± 0.0309 | 0.8549 ± 0.0335 |
+
+Paired CRPS difference over 1015 points: mean 0.00077,
+95 % CI [0.00040, 0.00116], **Wilcoxon p = 0.0027**.
+
+**Stage 5's CRPS advantage is statistically significant — and not worth
+having.** Both statements are true, and the gap between them is the point:
+
+* The effect is **0.68 %** (CI 0.35–1.02 %), with **Cohen's d = 0.12**, below
+  the conventional 0.2 threshold for "small".
+* It is detectable only because n = 1015. At the 25-run level it would not be.
+* **47.9 % of individual points get worse** — barely better than a coin flip.
+* Meanwhile **Cov90 falls from 0.8656 to 0.8549**, moving 1.07 points further
+  from its 0.90 target, exactly the interval-narrowing seen in the single run.
+
+So adversarial fine-tuning buys a sub-1 % improvement in a distributional
+score by making the predictive intervals less trustworthy. For a reliability
+model whose output is a risk interval, that is a bad trade regardless of the
+p-value.
+
+This also revises the single-run reading above: CRPS is not *unchanged*, it
+improves very slightly. The conclusion is unaffected, and the reason is
+sharper — the issue is not that Stage 5 does nothing, but that what it does is
+not what a reliability model needs.
+
 ## Caveats
 
-Single seed, single run. The consistent direction across seven metrics
-(coverage down at all three levels, MACE up, width down) is more informative
-than any one of them, but a multi-seed repeat via `17_cv_stage4c_stage5.py`
-would be needed before this appears as a headline claim. It would cost roughly
-an hour and is worth doing if Stage 5 is discussed in the paper at any length.
+The CV uses its own fold splits rather than the fixed train/val/test split, so
+its absolute CRPS (0.1136) is not comparable with the single-run test figure
+(0.0784); only the paired within-fold comparison is meaningful. Both analyses
+agree on direction, which is what matters.
