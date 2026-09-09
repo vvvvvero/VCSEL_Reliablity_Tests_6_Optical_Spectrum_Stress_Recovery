@@ -117,10 +117,39 @@ _LEAKAGE_BIAS_BOUND = 0.30  # tanh-bounded: max |bias| in normalised space
 # NOTE this changes what CRPSS / coverage / W1 are averaged over, so these
 # metrics are NOT comparable with the 6-feature runs. Set EXTENDED_FEATURES
 # to False in config.py to reproduce the old definition.
+# INCLUDE_LEAKAGE re-admits IDLeak/IGLeak to the generated set. They were
+# excluded because their intervals covered almost nothing (Cov50/80/90 of
+# 0.024/0.060/0.107 and 0.000/0.021/0.043), which was attributed to heavy
+# tails. That attribution was wrong: measured leakage kurtosis is 2.53 and
+# 2.48, LIGHTER than Gaussian's 3.0, and a Student-t fit returns df ~ 1e8.
+# The residuals are simply off-centre (+0.31 and +0.23 sigma), which the
+# zero-mean AR(1) process could not represent until the per-feature offset
+# was added. With that in place the exclusion may no longer be needed --
+# this switch is what tests it.
+#
+# TESTED, AND IT DOES NOT: with the offset active, leakage reaches Cov90 of
+# only 0.0595 (IDLeak) and 0.0213 (IGLeak), and admitting it costs the other
+# nine features (CRPSS 0.2400 -> 0.2259, Cov90 0.8719 -> 0.8653, aggregate
+# MACE 0.0266 -> 0.0335).
+#
+# The reason is width, not centre. The learned sigma_ref sits at ~0.080 for
+# EVERY feature, while the residual spread leakage needs is 0.327 and 0.397 --
+# a 4.1x and 5.1x shortfall. An offset moves the interval; it cannot widen it.
+# Vth has the same problem (needs 3.3x) which is why it also sits at 0.80
+# rather than 0.90.
+#
+# So the real limitation is that sigma_ref barely varies across features
+# (0.078-0.081 spread over features whose residual spreads differ 13-fold).
+# Fixing that -- a per-feature sigma scale with a wider reachable range, or
+# initialising sigma_ref from the measured per-feature residual spread -- is
+# the next thing to try, and would likely help Vth/IDSS/RON as well as
+# leakage. Until then leakage stays excluded.
+INCLUDE_LEAKAGE = False
+
 _LEAKAGE_SET = set(_LEAKAGE_FEAT_INDICES)
 if getattr(cfg, "EXTENDED_FEATURES", False):
     STABLE_FEAT_INDICES = [i for i in range(cfg.FEATURE_DIM)
-                           if i not in _LEAKAGE_SET]
+                           if INCLUDE_LEAKAGE or i not in _LEAKAGE_SET]
 else:
     STABLE_FEAT_INDICES = [0, 1, 2, 3]   # Vth, IDSS, RON, gmmax
 N_STABLE_FEATURES   = len(STABLE_FEAT_INDICES)
