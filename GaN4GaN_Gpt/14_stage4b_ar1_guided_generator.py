@@ -377,6 +377,29 @@ ARRHENIUS_TREND_EA_REF = {0: 0.67, 1: 0.35, 2: 0.20, 3: 0.35}
 # constrains only the features listed in ARRHENIUS_TREND_EA_REF above.
 EA_SIGMA_DEFAULT = 0.35
 
+# Bound on the learnable per-feature residual offset, in normalised units.
+#
+# The AR(1) residual process is zero-mean by construction, so the generator can
+# only place its interval symmetrically around the Stage-3 prediction. Measured
+# on the 11-feature backbone, several residuals are systematically off-centre:
+#
+#   feature        mean/std of residual      fraction positive
+#   SS_sat              +0.61                     0.91
+#   gm_fwhm_sat         -0.48                     0.14
+#   DIBL                +0.32                     0.82
+#   IDLeak              +0.31                     0.61
+#   SS_lin              +0.30                     0.64
+#   IGLeak              +0.23                     0.59
+#
+# A 90 % interval of the right WIDTH but the wrong CENTRE under-covers. Direct
+# check on IDLeak: a symmetric interval about zero covers 0.892, the same
+# interval recentred on the residual mean covers 0.931.
+#
+# 0.6 in normalised units is ~2x the largest measured offset, so the bound
+# never binds in practice; it exists to stop the offset absorbing signal that
+# belongs in the ODE.
+OFFSET_BOUND = 0.6
+
 
 def arrhenius_trend_loss(
     sigma_pred: "torch.Tensor",   # (B, n_features)
@@ -852,7 +875,11 @@ class AR1GuidedResidualGeneratorStable(nn.Module):
             d_t   = rho_i * d_prev + sq * sigma * eps
             deltas.append(d_t)
             d_prev = d_t.detach()
-        return torch.stack(deltas, dim=1)   # (B, T_future, 4)
+        out = torch.stack(deltas, dim=1)          # (B, T_future, n_features)
+        # Shift the whole zero-mean AR(1) path onto the residual's true centre.
+        # Added AFTER the recursion so it does not feed back through rho and
+        # inflate later steps.
+        return out + self.offset.view(1, 1, -1)
 
     def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10,
                  times_future=None):
@@ -1020,7 +1047,11 @@ class AR1GuidedResidualGeneratorPhysGated(nn.Module):
             d_t   = rho_i * d_prev + sq * sigma * eps
             deltas.append(d_t)
             d_prev = d_t.detach()
-        return torch.stack(deltas, dim=1)   # (B, T_future, 4)
+        out = torch.stack(deltas, dim=1)          # (B, T_future, n_features)
+        # Shift the whole zero-mean AR(1) path onto the residual's true centre.
+        # Added AFTER the recursion so it does not feed back through rho and
+        # inflate later steps.
+        return out + self.offset.view(1, 1, -1)
 
     def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10,
                  times_future=None):
@@ -1151,6 +1182,11 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         assert ea_init_t.numel() == n_output, (ea_init_t.numel(), n_output)
         self.log_Ea_sigma = nn.Parameter(torch.log(ea_init_t.clamp(min=0.05)))
 
+        # Per-feature residual offset, tanh-bounded to +-OFFSET_BOUND. Starts
+        # at zero so an untrained generator reproduces the previous behaviour
+        # exactly, and the CRPS loss decides whether to move it.
+        self.offset_raw = nn.Parameter(torch.zeros(n_output))
+
     @property
     def sigma_ref(self) -> torch.Tensor:
         return torch.exp(self.log_sigma_ref)
@@ -1158,6 +1194,11 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
     @property
     def Ea_sigma(self) -> torch.Tensor:
         return torch.exp(self.log_Ea_sigma)
+
+    @property
+    def offset(self) -> torch.Tensor:
+        """Learned per-feature residual offset, bounded to +-OFFSET_BOUND."""
+        return OFFSET_BOUND * torch.tanh(self.offset_raw)
 
     def _arrhenius_sigma(self, T_K: torch.Tensor) -> torch.Tensor:
         """sigma_ref * exp(-Ea_sigma/kB * (1/T - 1/T_ref)), shape (B, n_features)."""
@@ -1244,7 +1285,11 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
             d_t   = rho_i * d_prev + sq * sigma * eps
             deltas.append(d_t)
             d_prev = d_t.detach()
-        return torch.stack(deltas, dim=1)   # (B, T_future, 4)
+        out = torch.stack(deltas, dim=1)          # (B, T_future, n_features)
+        # Shift the whole zero-mean AR(1) path onto the residual's true centre.
+        # Added AFTER the recursion so it does not feed back through rho and
+        # inflate later steps.
+        return out + self.offset.view(1, 1, -1)
 
     def sample_n(self, z_prefix_last, T_K, x0, log_t_suffix, n_samples, T_future=10,
                  times_future=None):
