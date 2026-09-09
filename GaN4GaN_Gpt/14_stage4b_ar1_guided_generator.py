@@ -429,6 +429,29 @@ EA_SIGMA_DEFAULT = 0.35
 # belongs in the ODE.
 OFFSET_BOUND = 0.6
 
+# Per-feature starting value for the Arrhenius sigma reference, keyed by
+# feature index, in normalised residual units.
+#
+# Previously every feature started at a single scalar (0.08) and barely moved:
+# after training, sigma_ref spanned 0.0793-0.0818, a 3.2 % spread across
+# features whose residual spreads differ 13-fold (0.073 for gm_fwhm_sat to
+# 0.927 for IDSS). The bounded context correction (+-50 %) cannot bridge that:
+# 6 of 9 features could not reach their required width even at the cap, and
+# leakage was short by 4-5x. Coverage was therefore capped from below by an
+# interval that was simply too narrow -- Vth needed 3.3x more.
+#
+# These are the MEASURED per-device residual standard deviations of the
+# Stage-3 forecast on the 11-feature backbone, so the generator starts at the
+# right order of magnitude and the optimiser refines rather than rediscovers
+# it. Features absent from the map fall back to SIGMA_REF_DEFAULT.
+SIGMA_REF_BY_FEATURE = {
+    "Vth": 0.268, "IDSS": 0.927, "RON": 0.337, "gmmax": 0.409,
+    "IDLeak": 0.327, "IGLeak": 0.397,
+    "SS_lin": 0.107, "SS_sat": 0.122, "gm_fwhm_sat": 0.073,
+    "DIBL": 0.104, "V_gmpeak_sat": 0.126,
+}
+SIGMA_REF_DEFAULT = 0.08
+
 
 def arrhenius_trend_loss(
     sigma_pred: "torch.Tensor",   # (B, n_features)
@@ -1150,7 +1173,7 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         n_output:              int   = N_STABLE_FEATURES,
         latent_dim:            int   = cfg.LATENT_DIM,
         n_context_feat:        int   = cfg.FEATURE_DIM,
-        sigma_ref_init:        float = 0.08,
+        sigma_ref_init:        float = None,
         # Per-feature Ea_sigma initialisation. None (the default) builds a
         # length-n_output list from ARRHENIUS_TREND_EA_REF, falling back to
         # EA_SIGMA_DEFAULT for features with no validated reference value.
@@ -1192,7 +1215,18 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         # into the architecture. log_sigma_ref ensures sigma_ref > 0 via exp;
         # Ea_sigma similarly via exp(log_Ea_sigma) (same convention as
         # PhysicsODE.Ea_rev/Ea_irrev in 02_physics_latent.py).
-        self.log_sigma_ref = nn.Parameter(torch.log(torch.full((n_output,), float(sigma_ref_init))))
+        # Per-feature init from the measured residual spreads. sigma_ref_init
+        # is honoured when explicitly passed (tests, ablations); otherwise the
+        # per-feature table is used, since one scalar across features whose
+        # spreads differ 13-fold left every interval the same width.
+        if sigma_ref_init is None:
+            _names = [cfg.FEATURES[i] for i in STABLE_FEAT_INDICES[:n_output]]                      if len(STABLE_FEAT_INDICES) >= n_output else []
+            _init = [SIGMA_REF_BY_FEATURE.get(nm, SIGMA_REF_DEFAULT) for nm in _names]                     if _names else [SIGMA_REF_DEFAULT] * n_output
+            sigma_ref_t = torch.tensor(_init[:n_output], dtype=torch.float32)
+        else:
+            sigma_ref_t = torch.full((n_output,), float(sigma_ref_init))
+        assert sigma_ref_t.numel() == n_output, (sigma_ref_t.numel(), n_output)
+        self.log_sigma_ref = nn.Parameter(torch.log(sigma_ref_t.clamp(min=1e-4)))
         # One Ea per generated feature. Previously a fixed 4-tuple sliced by
         # [:n_output], which SILENTLY produced a length-4 parameter when
         # n_output was larger -- log_sigma_ref (11) and log_Ea_sigma (4) then
