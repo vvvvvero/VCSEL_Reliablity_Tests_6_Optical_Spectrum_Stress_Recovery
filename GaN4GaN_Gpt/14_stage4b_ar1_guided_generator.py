@@ -464,6 +464,40 @@ SIGMA_REF_BY_FEATURE = {
 }
 SIGMA_REF_DEFAULT = 0.08
 
+# --- interval-width fixes (both default OFF; see the leakage notes above) ---
+#
+# Measured on the sigma-initialised generator, two mechanisms leave the
+# realised interval at roughly half the width the residuals need:
+#
+#   1. The bounded context correction can shrink sigma as well as grow it.
+#      IDLeak's effective sigma came out 0.219 against a sigma_ref of 0.322,
+#      a 32 % cut sitting near the -50 % bound.
+#   2. The AR(1) recursion starts at d=0, so the FIRST forecast step has
+#      sd = sigma*sqrt(1-rho^2) instead of sigma. Measured at t0: IDLeak
+#      0.188 vs 0.322, Vth 0.209 vs 0.262. Early steps are systematically
+#      under-dispersed for every feature.
+#
+# Both are opt-in so each can be attributed separately.
+#
+# TESTED, AND BOTH ARE LEFT OFF. Each raises Cov90 but costs more sharpness
+# than it buys, on the nine features currently generated:
+#
+#   variant            CRPS    CRPSS   Cov50   Cov80   Cov90    MACE
+#   baseline         0.0754   0.2325  0.6445  0.8584  0.9079  0.0287
+#   one-sided only   0.0805   0.1880  0.7147  0.8966  0.9258  0.0486
+#   stat-init only   0.0808   0.1918  0.6531  0.8579  0.9053  0.0334
+#   both             0.1003   0.0269  0.7719  0.9155  0.9442  0.0677
+#
+# The baseline already meets the 0.90 target, so extra width is pure loss:
+# with both on, Vth reaches 0.9815 and IDSS 0.9938 -- far past nominal -- and
+# CRPSS collapses from 0.2325 to 0.0269. The diagnosis that leakage is
+# under-covered because its realised interval is too narrow still stands, but
+# widening EVERY feature is the wrong instrument, because only leakage is
+# short. A leakage-specific remedy would have to widen those two channels
+# without touching the nine that are already calibrated.
+CORRECTION_ONE_SIDED = False   # if True, context may only widen sigma, never narrow
+AR1_STATIONARY_INIT  = False   # if True, seed the AR(1) state from N(0, sigma)
+
 
 def arrhenius_trend_loss(
     sigma_pred: "torch.Tensor",   # (B, n_features)
@@ -1121,7 +1155,14 @@ class AR1GuidedResidualGeneratorPhysGated(nn.Module):
             rho_eff_per_step = rho.unsqueeze(1) ** expo
 
         deltas = []
-        d_prev = torch.zeros(B, self.n_features, device=dev)
+        if AR1_STATIONARY_INIT:
+            # Seed from the process's stationary distribution N(0, sigma) so
+            # step 0 has sd sigma rather than sigma*sqrt(1-rho^2). Starting at
+            # exactly zero makes every early step too narrow, which matters
+            # most for features whose observations sit early.
+            d_prev = sigma * torch.randn(B, self.n_features, device=dev)
+        else:
+            d_prev = torch.zeros(B, self.n_features, device=dev)
         for t_idx in range(T_future):
             eps   = torch.randn(B, self.n_features, device=dev)
             rho_i = rho_eff_per_step[:, t_idx, :] if rho_eff_per_step is not None else rho
@@ -1345,6 +1386,11 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         # the Arrhenius baseline.
         sigma_base = self._arrhenius_sigma(T_K.reshape(-1))   # (B, n_features)
         correction = self.correction_bound * torch.tanh(out[:, self.n_features:])
+        if CORRECTION_ONE_SIDED:
+            # Context may widen the interval but not narrow it. sigma_ref is
+            # initialised from the measured residual spread, so narrowing it
+            # can only under-cover; the freedom was being spent that way.
+            correction = correction.clamp(min=0.0)
         sigma = sigma_base * (1.0 + correction)
         sigma = sigma.clamp(min=1e-4)
         return rho, sigma
@@ -1370,7 +1416,14 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
             rho_eff_per_step = rho.unsqueeze(1) ** expo
 
         deltas = []
-        d_prev = torch.zeros(B, self.n_features, device=dev)
+        if AR1_STATIONARY_INIT:
+            # Seed from the process's stationary distribution N(0, sigma) so
+            # step 0 has sd sigma rather than sigma*sqrt(1-rho^2). Starting at
+            # exactly zero makes every early step too narrow, which matters
+            # most for features whose observations sit early.
+            d_prev = sigma * torch.randn(B, self.n_features, device=dev)
+        else:
+            d_prev = torch.zeros(B, self.n_features, device=dev)
         for t_idx in range(T_future):
             eps   = torch.randn(B, self.n_features, device=dev)
             rho_i = rho_eff_per_step[:, t_idx, :] if rho_eff_per_step is not None else rho
