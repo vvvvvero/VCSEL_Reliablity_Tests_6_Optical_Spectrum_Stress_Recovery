@@ -127,23 +127,35 @@ _LEAKAGE_BIAS_BOUND = 0.30  # tanh-bounded: max |bias| in normalised space
 # was added. With that in place the exclusion may no longer be needed --
 # this switch is what tests it.
 #
-# TESTED, AND IT DOES NOT: with the offset active, leakage reaches Cov90 of
-# only 0.0595 (IDLeak) and 0.0213 (IGLeak), and admitting it costs the other
-# nine features (CRPSS 0.2400 -> 0.2259, Cov90 0.8719 -> 0.8653, aggregate
-# MACE 0.0266 -> 0.0335).
+# Tested twice, and it still does not work -- but each attempt moved the
+# diagnosis forward.
 #
-# The reason is width, not centre. The learned sigma_ref sits at ~0.080 for
-# EVERY feature, while the residual spread leakage needs is 0.327 and 0.397 --
-# a 4.1x and 5.1x shortfall. An offset moves the interval; it cannot widen it.
-# Vth has the same problem (needs 3.3x) which is why it also sits at 0.80
-# rather than 0.90.
+# Attempt 1 (offset only): Cov90 0.0595 / 0.0213. Cause was width, not centre:
+# sigma_ref sat at ~0.080 for EVERY feature while leakage needs 0.327/0.397,
+# a 4-5x shortfall. That motivated the per-feature sigma_ref initialisation.
 #
-# So the real limitation is that sigma_ref barely varies across features
-# (0.078-0.081 spread over features whose residual spreads differ 13-fold).
-# Fixing that -- a per-feature sigma scale with a wider reachable range, or
-# initialising sigma_ref from the measured per-feature residual spread -- is
-# the next thing to try, and would likely help Vth/IDSS/RON as well as
-# leakage. Until then leakage stays excluded.
+# Attempt 2 (offset + per-feature sigma_ref): Cov90 0.4048 / 0.2447. A large
+# gain, still far short. sigma_ref is now correct (ratio 0.98 of the needed
+# spread for every feature) so the remaining gap is elsewhere. Measured:
+#
+#   * The bounded context correction SHRINKS sigma below its reference. For
+#     IDLeak the effective sigma is 0.219 against a sigma_ref of 0.322 -- a
+#     32 % cut, close to the -50 % correction bound. The generator uses that
+#     freedom to narrow leakage specifically.
+#   * The AR(1) recursion starts from d=0, so the first forecast step has sd
+#     sigma*sqrt(1-rho^2) rather than sigma. Measured at t0: IDLeak 0.188 vs
+#     0.322. Leakage has the fewest observations and they sit early, so it is
+#     hit hardest.
+#
+# Together those put the realised interval at roughly half the width the
+# residuals need. For reference, a symmetric interval built directly from the
+# empirical residual sd covers 0.869 (IDLeak) and 0.862 (IGLeak), so the data
+# are coverable -- the generator's parameterisation is what falls short.
+#
+# Admitting leakage also still costs the other nine (CRPSS 0.2325 -> 0.2190),
+# so it stays excluded. The fix is not another sigma tweak: it is to stop the
+# context correction from narrowing, and to initialise the AR(1) state from
+# its stationary distribution instead of zero.
 INCLUDE_LEAKAGE = False
 
 _LEAKAGE_SET = set(_LEAKAGE_FEAT_INDICES)
