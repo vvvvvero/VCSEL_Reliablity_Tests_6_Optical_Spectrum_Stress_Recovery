@@ -81,6 +81,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 MEAN_HEAD_BOUND = 0.6
 
 CONDITIONS = ["A_full", "B_no_physics", "C_shuffled"]
+# Non-leaking ablation (34_): the control must withhold the prefix too.
+CONDITIONS_NOLEAK = ["D_z_only", "E_x0_only", "F_both"]
 
 
 def _load_module(alias, filename):
@@ -154,7 +156,12 @@ class PhysicsConditionGeneratorStable(nn.Module):
         log_scale_floor_init: float = -2.6,
     ):
         super().__init__()
-        assert condition_mode in ("full", "none", "shuffled")
+        # D/E/F withhold the PREFIX, not just the latent. 34_ shows x0 alone
+        # explains 0.36 of the residual and reconstructs z_phys at R^2 0.27, so
+        # "none" is not a physics-free control -- it is physics-via-prefix. Only
+        # these conditions isolate the latent as the sole per-device route.
+        assert condition_mode in ("full", "none", "shuffled",
+                                  "z_only", "x0_only", "both")
         if n_output is None:
             n_output = self.N_STABLE
         self.condition_mode = condition_mode
@@ -230,6 +237,15 @@ class PhysicsConditionGeneratorStable(nn.Module):
         x0_ctx = x0[:, : self._n_ctx_feat]
 
         log_t = log_t_suffix.reshape(B, -1)[:, :1]
+
+        # z_only  : latent kept, prefix withheld  -> physics is the ONLY route
+        # x0_only : prefix kept, latent withheld   -> the honest control
+        # both    : upper bound on what either can add
+        if self.condition_mode == "z_only":
+            x0_ctx = torch.zeros_like(x0_ctx)
+        elif self.condition_mode == "x0_only":
+            z_phys = torch.zeros_like(z_phys)
+            dz_phys = torch.zeros_like(dz_phys)
 
         ctx = torch.cat(
             [z_phys.reshape(B, -1), dz_phys.reshape(B, -1), T_norm, x0_ctx.reshape(B, -1), log_t],
@@ -937,13 +953,15 @@ def main():
 
     requested = [c.strip() for c in args.conditions.split(",") if c.strip()]
     for c in requested:
-        assert c in CONDITIONS, f"Unknown condition {c!r}; choose from {CONDITIONS}"
+        assert c in CONDITIONS + CONDITIONS_NOLEAK, (
+            f"Unknown condition {c!r}; choose from {CONDITIONS + CONDITIONS_NOLEAK}")
 
     all_results = []
     for condition_mode_full in requested:
         condition_mode = condition_mode_full.split("_", 1)[0].lower()
         # map "A_full" -> "full", "B_no_physics" -> "no", "C_shuffled" -> "shuffled"
-        mode_map = {"a": "full", "b": "none", "c": "shuffled"}
+        mode_map = {"a": "full", "b": "none", "c": "shuffled",
+                    "d": "z_only", "e": "x0_only", "f": "both"}
         mode = mode_map[condition_mode]
         log.info("=" * 70)
         log.info("Running condition %s (mode=%s)", condition_mode_full, mode)
