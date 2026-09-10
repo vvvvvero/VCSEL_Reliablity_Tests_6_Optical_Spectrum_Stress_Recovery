@@ -488,8 +488,31 @@ SIGMA_REF_DEFAULT = 0.08
 #                                            when leakage under-covered
 #
 # So this is a re-scaling per feature, not a global shrink, and it may
-# incidentally address the leakage width problem. It still needs the same
-# before/after comparison every other width change got.
+# incidentally address the leakage width problem.
+#
+# TESTED, AND REJECTED AS THE DEFAULT (filtered backbone, 200 devices).
+# It does exactly what was hoped for leakage, and it costs too much elsewhere:
+#
+#   feature        Cov90 table   Cov90 robust
+#   IDLeak            0.0000        0.9286      <- fixed, and only this fixes it
+#   IGLeak            0.0000        0.8936      <- fixed
+#   IDSS              0.9814        0.7143      <- REGRESSION
+#   RON               0.9385        0.7846      <- REGRESSION
+#   gmmax             0.9615        0.8782      <- REGRESSION
+#   Vth               0.9259        0.9815
+#
+# The cause is not a bug: the table sigmas for IDSS/RON were inflated by the
+# three faulty devices 28_ removes, so the robust estimate is genuinely
+# tighter -- and too tight once those devices are gone.
+#
+# The standing requirement on this work is that the nine already-generated
+# features must not regress; leakage is explicitly secondary to that. Three
+# features losing 10-24 points of coverage to gain two is the wrong trade, so
+# the default stays False and INCLUDE_LEAKAGE stays False with it.
+#
+# Recovering leakage without this cost needs a per-feature choice of estimator
+# (robust for the leakage channels, table for the rest) rather than one global
+# flag. Not attempted yet.
 SIGMA_REF_ROBUST = False
 # 1.4826 * MAD estimates the sd of a Gaussian; scale it up so the interval is
 # not set by the median device alone.
