@@ -65,7 +65,36 @@ removes.
 To answer it, the control has to withhold the prefix too -- compare
 [z_phys, T, t] against [x0, T, t] against [z_phys, x0, T, t] -- so that the
 physics latent is the only route to per-device information in its arm. That
-is a different ablation from A/B/C and is the one worth running.
+ablation is implemented as D_z_only / E_x0_only / F_both in 16_.
+
+RESULT (filtered backbone, cond-mean head, 70 epochs, early stopping DISABLED
+so all three conditions get an identical budget -- verified: 70/70 epochs each,
+zero early stops, 3 seeds):
+
+  seed      D_z_only  E_x0_only     F_both      D-E
+  42          0.1987     0.2002     0.1964    -0.7 %
+  101         0.1929     0.1887     0.1843    +2.2 %
+  202         0.1975     0.1996     0.1582    -1.1 %
+  mean        0.1964     0.1962     0.1796    +0.1 %
+
+D - E = +0.1 %, D wins 1/3 seeds -- far below the 2.7 % noise floor.
+
+So with the leak removed and the budget equalised, the physics latent and the
+raw prefix are INTERCHANGEABLE as conditioning information. The latent is not
+worse, which matters: it reaches the same forecast quality from 6 numbers
+instead of 11 raw observations, and those 6 carry mechanism labels. But it is
+not better, and this experiment gives no support for a claim that it is.
+
+An honest caveat on F_both. It is worst on test CRPSS (0.1796) while reaching
+the BEST val_CRPS (0.0536 vs 0.0560 / 0.0565), and its seed spread is 6x D's
+(sd 0.0195 vs 0.0031). This is not overfitting in the usual sense -- its final
+train_CRPS (0.0853) is essentially the others' (0.0864 / 0.0865) -- and its
+long-horizon RMSE is normal (0.3197 vs 0.3135 / 0.3098 at 2000 h), so the
+POINT prediction is fine. The damage is in the interval: F has the lowest
+Cov90 (0.6379 vs 0.6668 / 0.6747) and the worst MACE (0.0704 vs 0.0558 /
+0.0512). Given both inputs the model narrows its bands and mis-calibrates,
+unstably across seeds. F is therefore not a usable upper bound, and the D vs E
+comparison -- which is the one the paper needs -- stands on its own.
 
 Usage
 -----
