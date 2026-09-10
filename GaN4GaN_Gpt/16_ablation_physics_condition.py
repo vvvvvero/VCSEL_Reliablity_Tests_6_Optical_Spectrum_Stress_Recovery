@@ -317,6 +317,7 @@ def train_ablation_generator(
     lambda_scale: float = 0.01,
     lambda_calib: float = 0.0,
     lambda_phys_sens: float = 0.0,
+    lambda_zphys_contrast: float = 0.0,
     sigma_min: float = 0.012,
     output_dir: Optional[str] = None,
     ckpt_name: str = "generator_best.pt",
@@ -330,6 +331,10 @@ def train_ablation_generator(
     _fit_ar1_targets = stage4b_mod._fit_ar1_targets
     coverage_calibration_loss = stage4b_mod.coverage_calibration_loss
     STABLE_IDX = generator.STABLE_INDICES
+
+    # Same module the rest of this loop's losses come from, so the ablation
+    # scores the identical implementation Stage 4C would use.
+    _zphys_contrastive = stage4b_mod.z_phys_contrastive_loss
 
     def _phys_sens_loss(gen, z_pfx, z_ref, T_K, x0, log_t, margin=0.05):
         """Local adapter of 14_...::physics_sensitivity_loss for the ablation
@@ -424,10 +429,29 @@ def train_ablation_generator(
             if lambda_phys_sens > 0:
                 sens_l = _phys_sens_loss(generator, z_pfx, z_ref, T_K, x0, log_t)
 
+            # Contrastive term, reused from 14_. _phys_sens_loss only requires
+            # the output to CHANGE under a shuffled z_phys, which a network can
+            # satisfy by reacting to it arbitrarily; measured at
+            # lambda_phys_sens=0.5 it left A/B/C unchanged. This one requires
+            # the REAL z_phys to beat a wrong device's on per-device CRPS, so
+            # it is the condition the ablation actually tests.
+            contrast_l = torch.tensor(0.0, device=device)
+            if lambda_zphys_contrast > 0:
+                # The generator predicts only the STABLE feature subset, so
+                # x_hat must be sliced to match -- x_true_loss already is.
+                contrast_l = _zphys_contrastive(
+                    generator, z_pfx, T_K, x0, log_t,
+                    x_true_future=torch.nan_to_num(x_true_loss[:, plen:, :], nan=0.0),
+                    future_mask=mask[:, plen:].bool(),
+                    x_hat_future=x_hat[:, plen:, :][:, :, STABLE_IDX].detach(),
+                    n_samples=n_train_samples,
+                )
+
             loss = (
                 lambda_crps * crps + lambda_ar1 * rho_loss + lambda_var * sigma_loss
                 + lambda_pinball * pinball + lambda_scale * scale_reg
                 + lambda_calib * calib_l + lambda_phys_sens * sens_l
+                + lambda_zphys_contrast * contrast_l
             )
             opt.zero_grad()
             loss.backward()
@@ -744,6 +768,7 @@ def run_condition(condition_mode: str, model, train_cache, val_cache, test_cache
         patience=args.patience, output_dir=output_dir,
         lambda_pinball=args.lambda_pinball,
         lambda_calib=args.lambda_calib, lambda_phys_sens=args.lambda_phys_sens,
+        lambda_zphys_contrast=args.lambda_zphys_contrast,
         sigma_min=args.sigma_min,
         ckpt_name=f"generator_{condition_mode}.pt",
     )
@@ -821,6 +846,8 @@ def _parse_args():
     p.add_argument("--lambda-pinball", type=float, default=0.10)
     p.add_argument("--lambda-calib", type=float, default=0.0,
         help="Weight for coverage-calibration loss (0=off).")
+    p.add_argument("--lambda-zphys-contrast", type=float, default=0.0,
+                   help="weight on the real-vs-shuffled z_phys CRPS contrastive loss")
     p.add_argument("--lambda-phys-sens", type=float, default=0.0,
         help="Weight for physics-latent sensitivity loss (0=off, only "
              "applied for condition A_full).")
