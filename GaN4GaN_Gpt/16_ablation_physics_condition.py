@@ -76,6 +76,10 @@ import config as cfg
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 
+# Bound on the z_phys-conditioned residual mean, matching Stage 4C's
+# OFFSET_BOUND so the mean head cannot absorb signal the AR(1) should carry.
+MEAN_HEAD_BOUND = 0.6
+
 CONDITIONS = ["A_full", "B_no_physics", "C_shuffled"]
 
 
@@ -141,6 +145,7 @@ class PhysicsConditionGeneratorStable(nn.Module):
     def __init__(
         self,
         condition_mode: str = "full",
+        cond_mean: bool = False,
         noise_dim: int = 16,
         hidden_dim: int = 96,
         n_output: int = None,
@@ -153,6 +158,11 @@ class PhysicsConditionGeneratorStable(nn.Module):
         if n_output is None:
             n_output = self.N_STABLE
         self.condition_mode = condition_mode
+        # When True the head also emits a per-device residual MEAN driven by
+        # the context (and hence by z_phys). 32_ shows the z_phys signal lives
+        # mostly in the mean (R^2 +0.190) rather than the spread (+0.074),
+        # which the zero-mean AR(1) below cannot represent at all.
+        self.cond_mean = bool(cond_mean)
         self.noise_dim = noise_dim
         self.n_features = n_output
         self.latent_dim = latent_dim
@@ -170,7 +180,7 @@ class PhysicsConditionGeneratorStable(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2 * n_output),
+            nn.Linear(hidden_dim, (3 if cond_mean else 2) * n_output),
         )
         self.log_scale_floor = nn.Parameter(torch.full((n_output,), float(log_scale_floor_init)))
         for m in self.net:
@@ -235,16 +245,21 @@ class PhysicsConditionGeneratorStable(nn.Module):
 
         inp = torch.cat([noise_init, ctx], dim=-1)
         out = self.net(inp)
-        rho = torch.sigmoid(out[:, : self.n_features]) * 0.97
+        n = self.n_features
+        rho = torch.sigmoid(out[:, :n]) * 0.97
         sig_floor = torch.exp(self.log_scale_floor).unsqueeze(0).expand(B, -1)
-        sigma = sig_floor + F.softplus(out[:, self.n_features :])
-        return rho, sigma
+        sigma = sig_floor + F.softplus(out[:, n:2 * n])
+        # mu is bounded like Stage 4C's OFFSET_BOUND so it cannot absorb
+        # arbitrary signal; zero at init because the head is zero-initialised.
+        mu = (torch.tanh(out[:, 2 * n:3 * n]) * MEAN_HEAD_BOUND
+              if self.cond_mean else torch.zeros_like(rho))
+        return rho, sigma, mu
 
     def forward(self, z_prefix_last, T_K, x0, log_t_suffix, T_future=10, noise=None,
                 times_future=None, z_ref=None):
         B = z_prefix_last.shape[0]
         dev = z_prefix_last.device
-        rho, sigma = self._context_params(z_prefix_last, T_K, x0, log_t_suffix, z_ref=z_ref)
+        rho, sigma, mu = self._context_params(z_prefix_last, T_K, x0, log_t_suffix, z_ref=z_ref)
 
         rho_eff_per_step = None
         if times_future is not None and times_future.shape[1] >= 2:
@@ -264,7 +279,7 @@ class PhysicsConditionGeneratorStable(nn.Module):
             rho_i = rho_eff_per_step[:, t_idx, :] if rho_eff_per_step is not None else rho
             sq = torch.sqrt((1.0 - rho_i ** 2).clamp(min=1e-6))
             d_t = rho_i * d_prev + sq * sigma * eps
-            deltas.append(d_t)
+            deltas.append(d_t + mu)
             d_prev = d_t.detach()
         return torch.stack(deltas, dim=1)
 
@@ -345,9 +360,9 @@ def train_ablation_generator(
         B = z_pfx.shape[0]
         if B <= 1 or gen.condition_mode != "full":
             return z_pfx.sum() * 0.0
-        rho_real, sigma_real = gen._context_params(z_pfx, T_K, x0, log_t, z_ref=z_ref)
+        rho_real, sigma_real, _ = gen._context_params(z_pfx, T_K, x0, log_t, z_ref=z_ref)
         perm = torch.randperm(B, device=z_pfx.device)
-        rho_shuf, sigma_shuf = gen._context_params(z_pfx[perm], T_K, x0, log_t, z_ref=z_ref[perm])
+        rho_shuf, sigma_shuf, _ = gen._context_params(z_pfx[perm], T_K, x0, log_t, z_ref=z_ref[perm])
         rho_diff = (rho_real - rho_shuf).abs().mean(dim=-1)
         sigma_diff = ((sigma_real - sigma_shuf).abs() / sigma_real.detach().clamp(min=1e-4)).mean(dim=-1)
         response = 0.5 * (rho_diff + sigma_diff)
@@ -407,7 +422,7 @@ def train_ablation_generator(
             x_true_loss = x_true[:, :, sfx]
 
             crps = crps_mc_loss(x_pred_full, x_true_loss, mask, prefix_len=plen)
-            rho_pred, sigma_pred = generator._context_params(z_pfx, T_K, x0, log_t, z_ref=z_ref)
+            rho_pred, sigma_pred, _ = generator._context_params(z_pfx, T_K, x0, log_t, z_ref=z_ref)
             rho_target, sigma_target = _fit_ar1_targets(
                 x_true, x_hat, plen, feat_indices=STABLE_IDX, device_center=True,
                 times_future=times_future_t,
@@ -757,6 +772,7 @@ def run_condition(condition_mode: str, model, train_cache, val_cache, test_cache
     stage4a_mod = mods["stage4a"]
     generator = PhysicsConditionGeneratorStable(
         condition_mode=condition_mode,
+        cond_mean=getattr(args, "cond_mean", False),
         noise_dim=args.noise_dim,
         hidden_dim=args.hidden_dim,
     ).to(device)
@@ -846,6 +862,8 @@ def _parse_args():
     p.add_argument("--lambda-pinball", type=float, default=0.10)
     p.add_argument("--lambda-calib", type=float, default=0.0,
         help="Weight for coverage-calibration loss (0=off).")
+    p.add_argument("--cond-mean", action="store_true",
+                   help="condition the residual MEAN on z_phys (see 32_)")
     p.add_argument("--lambda-zphys-contrast", type=float, default=0.0,
                    help="weight on the real-vs-shuffled z_phys CRPS contrastive loss")
     p.add_argument("--lambda-phys-sens", type=float, default=0.0,
