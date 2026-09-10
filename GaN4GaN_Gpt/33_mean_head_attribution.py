@@ -106,7 +106,10 @@ cache = s4a._cache_trajectories(model, dl, "cpu", tm._forward, P)
 
 G = abl.PhysicsConditionGeneratorStable(condition_mode="full", cond_mean=True,
                                         noise_dim=16, hidden_dim=96)
-ckp = os.path.join(EXT, "ablation_abc_s42_cmean", "checkpoints", "generator_full.pt")
+import sys as _s
+VAR = _s.argv[1] if len(_s.argv) > 1 else "ablation_abc_s42_cmean"
+print("VARIANT:", VAR)
+ckp = os.path.join(EXT, VAR, "checkpoints", "generator_full.pt")
 G.load_state_dict(torch.load(ckp, map_location="cpu", weights_only=False)["state_dict"])
 G.eval()
 
