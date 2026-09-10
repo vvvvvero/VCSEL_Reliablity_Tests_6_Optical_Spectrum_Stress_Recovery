@@ -495,6 +495,40 @@ SIGMA_REF_ROBUST = False
 # not set by the median device alone.
 SIGMA_ROBUST_SCALE = 1.5
 
+_ROBUST_CACHE = {}
+
+
+def _robust_sigma_table():
+    """Per-feature sigma from a MAD spread of the CURRENT dataset.
+
+    Computed from the data rather than the hard-coded table, so it follows
+    whichever dataset is loaded (filtered or not). Cached per path since the
+    generator is constructed many times per run.
+    """
+    path = cfg.PROCESSED_DATA_PATH
+    if path in _ROBUST_CACHE:
+        return _ROBUST_CACHE[path]
+    import pickle as _pk
+    try:
+        with open(path, "rb") as fh:
+            _ds = _pk.load(fh)
+    except Exception:                                  # noqa: BLE001
+        return SIGMA_REF_BY_FEATURE
+    X = np.asarray(_ds["x_raw_deg"])
+    FMk = np.asarray(_ds["feature_mask"])
+    MKk = np.asarray(_ds["mask"])
+    out = {}
+    for _f, _n in enumerate(cfg.FEATURES):
+        v = X[:, :, _f][FMk[:, :, _f] & MKk]
+        v = v[np.isfinite(v)]
+        if v.size < 10:
+            out[_n] = SIGMA_REF_BY_FEATURE.get(_n, SIGMA_REF_DEFAULT)
+            continue
+        mad = 1.4826 * float(np.median(np.abs(v - np.median(v))))
+        out[_n] = max(mad * SIGMA_ROBUST_SCALE, 1e-3)
+    _ROBUST_CACHE[path] = out
+    return out
+
 # --- interval-width fixes (both default OFF; see the leakage notes above) ---
 #
 # Measured on the sigma-initialised generator, two mechanisms leave the
@@ -1323,7 +1357,8 @@ class AR1GuidedResidualGeneratorArrhenius(nn.Module):
         # spreads differ 13-fold left every interval the same width.
         if sigma_ref_init is None:
             _names = [cfg.FEATURES[i] for i in STABLE_FEAT_INDICES[:n_output]]                      if len(STABLE_FEAT_INDICES) >= n_output else []
-            _init = [SIGMA_REF_BY_FEATURE.get(nm, SIGMA_REF_DEFAULT) for nm in _names]                     if _names else [SIGMA_REF_DEFAULT] * n_output
+            _tbl = _robust_sigma_table() if SIGMA_REF_ROBUST else SIGMA_REF_BY_FEATURE
+            _init = [_tbl.get(nm, SIGMA_REF_DEFAULT) for nm in _names]                     if _names else [SIGMA_REF_DEFAULT] * n_output
             sigma_ref_t = torch.tensor(_init[:n_output], dtype=torch.float32)
         else:
             sigma_ref_t = torch.full((n_output,), float(sigma_ref_init))
