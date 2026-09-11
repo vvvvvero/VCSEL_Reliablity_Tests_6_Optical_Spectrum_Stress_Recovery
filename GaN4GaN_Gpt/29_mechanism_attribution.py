@@ -52,33 +52,52 @@ Usage
 Reproducibility across independent backbones
 --------------------------------------------
 The warning this script prints -- that a single checkpoint's split should be
-repeated before being quoted -- has now been acted on. Two INDEPENDENT Stage
-1-3 fits on the same filtered dataset (ext11_filtered, unseeded, future
-rollout MSE 0.02587; seed101, seed 101, 0.02661) give:
+repeated before being quoted -- has been acted on with FOUR independent Stage
+1-3 fits on the same filtered dataset (ext11_filtered unseeded, plus seeds
+101/202/303). The backbones agree closely: Stage 1 val loss 0.0725-0.0729,
+Stage 2 0.1056-0.1067, future rollout MSE 0.02587 / 0.02661 / 0.02609 /
+0.02785.
 
-  feature       kind    dominant latent      share bb1 / bb2
-  Vth           free    zM                     0.374 / 0.411
-  IDSS          free    zM                     0.339 / 0.358
-  RON           free    zM                     0.384 / 0.369
-  gmmax         free    zM                     0.401 / 0.438
-  IDLeak        free    zL                     0.774 / 0.777
-  IGLeak        free    zL                     0.932 / 0.936
-  SS_lin        free    zF                     0.693 / 0.678
-  SS_sat        free    zB                     0.704 / 0.714
-  gm_fwhm_sat   free    zM                     0.575 / 0.621
-  V_gmpeak_sat  free    zM                     0.735 / 0.775
+  feature       dominant   share (mean +- sd)   range
+  Vth           zM           0.396 +- 0.019     0.374-0.413
+  IDSS          zM           0.351 +- 0.008     0.339-0.358
+  RON           zM           0.378 +- 0.011     0.369-0.391
+  gmmax         zM           0.412 +- 0.029     0.376-0.438
+  IDLeak        zL           0.787 +- 0.015     0.774-0.808
+  IGLeak        zL           0.940 +- 0.015     0.930-0.962
+  SS_lin        zF           0.707 +- 0.044     0.678-0.771
+  SS_sat        zB           0.715 +- 0.032     0.683-0.759
+  gm_fwhm_sat   zM           0.575 +- 0.035     0.538-0.621
+  V_gmpeak_sat  zM           0.765 +- 0.034     0.735-0.808
 
-  dominant mechanism agrees on 10/10 free rows
-  mean |share difference| 0.0166, median 0.0103, max 0.0457 (n=28 non-zero)
-  Spearman rho on the four rows with >2 competing latents: 1.00, 1.00, 1.00, 0.80
+  dominant mechanism agrees on 10/10 free rows across all four fits
+  share sd across backbones: mean 0.0194, median 0.0159, max 0.0436 (n=28)
+
+Full table, mean +- sd over the four backbones:
+
+  feature              zG            zB            zF            zM            zL            zC
+  Vth           0.123±0.016   0.345±0.018             -   0.396±0.019             -   0.137±0.007
+  IDSS          0.101±0.007   0.288±0.006             -   0.351±0.008             -   0.260±0.005
+  RON           0.121±0.013   0.350±0.009             -   0.378±0.011             -   0.151±0.005
+  gmmax         0.124±0.018   0.339±0.020             -   0.412±0.029             -   0.125±0.005
+  IDLeak                  -   0.213±0.015             -             -   0.787±0.015             -
+  IGLeak        0.060±0.015             -             -             -   0.940±0.015             -
+  SS_lin        0.293±0.044             -   0.707±0.044             -             -             -
+  SS_sat        0.285±0.032   0.715±0.032             -             -             -             -
+  gm_fwhm_sat             -             -   0.425±0.035   0.575±0.035             -             -
+  V_gmpeak_sat  0.235±0.034             -             -   0.765±0.034             -             -
 
 So the assignment is a property of the data and the physics prior, not of one
-optimisation run. The shares are quotable at roughly +-0.05, and the dominant
-mechanism per feature is stable.
+optimisation run. Shares are quotable at about +-0.02 (1 sd), and the dominant
+mechanism per feature is stable across every fit.
 
-Note this says nothing about whether the shares are CORRECT -- two fits of the
-same model with the same prior can agree and both be wrong. It rules out
-run-to-run noise as the explanation, which was the open objection.
+Note what this does and does not establish. It rules out run-to-run
+optimisation noise, which was the standing objection. It does NOT show the
+shares are physically correct: four fits of the SAME model under the SAME
+sparsity mask and sign constraints can agree and still be wrong together.
+Validating the split against physics needs independent evidence -- e.g.
+comparing the fitted activation energies with literature values for the
+mechanisms each latent is supposed to represent.
 """
 
 import argparse
