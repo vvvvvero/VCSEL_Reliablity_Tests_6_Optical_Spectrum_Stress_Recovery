@@ -48,6 +48,37 @@ Usage
     python 29_mechanism_attribution.py
     python 29_mechanism_attribution.py --checkpoint A.pt --checkpoint B.pt
     python 29_mechanism_attribution.py --by-temperature --at-hours 2000
+
+Reproducibility across independent backbones
+--------------------------------------------
+The warning this script prints -- that a single checkpoint's split should be
+repeated before being quoted -- has now been acted on. Two INDEPENDENT Stage
+1-3 fits on the same filtered dataset (ext11_filtered, unseeded, future
+rollout MSE 0.02587; seed101, seed 101, 0.02661) give:
+
+  feature       kind    dominant latent      share bb1 / bb2
+  Vth           free    zM                     0.374 / 0.411
+  IDSS          free    zM                     0.339 / 0.358
+  RON           free    zM                     0.384 / 0.369
+  gmmax         free    zM                     0.401 / 0.438
+  IDLeak        free    zL                     0.774 / 0.777
+  IGLeak        free    zL                     0.932 / 0.936
+  SS_lin        free    zF                     0.693 / 0.678
+  SS_sat        free    zB                     0.704 / 0.714
+  gm_fwhm_sat   free    zM                     0.575 / 0.621
+  V_gmpeak_sat  free    zM                     0.735 / 0.775
+
+  dominant mechanism agrees on 10/10 free rows
+  mean |share difference| 0.0166, median 0.0103, max 0.0457 (n=28 non-zero)
+  Spearman rho on the four rows with >2 competing latents: 1.00, 1.00, 1.00, 0.80
+
+So the assignment is a property of the data and the physics prior, not of one
+optimisation run. The shares are quotable at roughly +-0.05, and the dominant
+mechanism per feature is stable.
+
+Note this says nothing about whether the shares are CORRECT -- two fits of the
+same model with the same prior can agree and both be wrong. It rules out
+run-to-run noise as the explanation, which was the open objection.
 """
 
 import argparse
