@@ -356,7 +356,9 @@ def train(model, mods, dataset, tr_idx, va_idx, device, epochs, lr, prefix_len,
                        batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=tm.collate_fn)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     best, best_state, bad = float("inf"), None, 0
+    best_ep, stopped_early, last_ep = 0, False, 0
     for ep in range(1, epochs + 1):
+        last_ep = ep
         model.train()
         for b in dl_tr:
             opt.zero_grad()
@@ -372,16 +374,57 @@ def train(model, mods, dataset, tr_idx, va_idx, device, epochs, lr, prefix_len,
         v = float(np.mean([x for x in vs if np.isfinite(x)])) if vs else float("nan")
         if np.isfinite(v) and v < best - 1e-6:
             best, bad, best_state = v, 0, copy.deepcopy(model.state_dict())
+            best_ep = ep
         else:
             bad += 1
         if ep == 1 or ep % 20 == 0:
             log.info("      epoch %3d/%d  val=%.5f  best=%.5f", ep, epochs, v, best)
         if bad >= patience:
             log.info("      early stop at epoch %d", ep)
+            stopped_early = True
             break
     if best_state:
         model.load_state_dict(best_state)
-    return model, best
+    # best_epoch and the early-stop flag are what separate "this candidate lost"
+    # from "this candidate never trained" -- the failure mode that invalidated
+    # the first screen, where losers came back at their initialisation.
+    return model, best, {"best_epoch": best_ep, "epochs_run": last_ep,
+                         "stopped_early": stopped_early}
+
+
+def _boundary_hits(ode, candidate=None, tol=0.02):
+    """Count shape exponents pinned at the edge of their permitted range.
+
+    The exponents are sigmoid-mapped into [EXP_MIN, EXP_MAX]. A value sitting
+    within `tol` of either edge means the optimiser pushed it as far as the
+    parameterisation allows -- the fit wanted a value the model cannot express,
+    so the reported exponent is a boundary artefact rather than a measurement.
+    Also flags exponents that never moved off their initialisation, which is
+    what the invalid first screen looked like.
+    """
+    # The log-creep law has no shape exponent -- its rate falls as 1/t by
+    # construction (see _time_factor). Its expG/B/F parameters exist on the
+    # shared module but are never read, so they sit at initialisation in every
+    # run. Reporting that as "never left initialisation" would invent a
+    # training failure that is really an unused parameter.
+    if candidate == "log":
+        return {"n_boundary_hits": 0, "at_boundary": [], "n_at_init": 0,
+                "at_init": [], "exponent_values": {},
+                "note": "log creep has no shape exponent; nothing to check"}
+    inits = {"G": 0.50, "B": 0.40, "F": 0.65}
+    hits, stuck, vals = [], [], {}
+    for n in ("G", "B", "F"):
+        raw = getattr(ode, f"exp{n}_raw", None)
+        if raw is None:
+            continue
+        v = float(ode._exp(raw))
+        vals[n] = v
+        if v <= EXP_MIN + tol or v >= EXP_MAX - tol:
+            hits.append(n)
+        if abs(v - inits[n]) < 1e-3:
+            stuck.append(n)
+    return {"n_boundary_hits": len(hits), "at_boundary": hits,
+            "n_at_init": len(stuck), "at_init": stuck, "exponent_values": vals}
 
 
 def evaluate(model, mods, dataset, idx, device, prefix_len, feat_idx):
@@ -418,6 +461,8 @@ def evaluate(model, mods, dataset, idx, device, prefix_len, feat_idx):
 def main():
     ap = argparse.ArgumentParser(description="Compare candidate rate laws")
     ap.add_argument("--candidate", choices=CANDIDATES + ["all"], default="all")
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="explicit dataset path (overrides the default)")
     ap.add_argument("--screen", action="store_true",
                     help="short run for ranking, not for publication numbers")
     ap.add_argument("--epochs", type=int, default=None)
@@ -446,8 +491,12 @@ def main():
         return
 
     epochs = args.epochs or (40 if args.screen else cfg.EPOCHS_STAGE3)
-    ds_path = (os.path.join(cfg.OUTPUT_PATH, "processed_data_ext.pkl")
-               if getattr(cfg, "EXTENDED_FEATURES", False) else cfg.PROCESSED_DATA_PATH)
+    # Explicit --dataset, because the default below silently ignored a cfg
+    # override: the first full-budget seeds ran on the UNFILTERED file while the
+    # rest of the pipeline had moved to the filtered one.
+    ds_path = args.dataset or (
+        os.path.join(cfg.OUTPUT_PATH, "processed_data_ext.pkl")
+        if getattr(cfg, "EXTENDED_FEATURES", False) else cfg.PROCESSED_DATA_PATH)
     with open(ds_path, "rb") as f:
         dataset = pickle.load(f)
 
@@ -471,7 +520,7 @@ def main():
         n_dyn = sum(p.numel() for p in model.ode.parameters())
         t0 = time.time()
         try:
-            model, val = train(model, mods, dataset, dataset["split"]["train"],
+            model, val, fit = train(model, mods, dataset, dataset["split"]["train"],
                                dataset["split"]["val"], device, epochs,
                                cfg.LR_STAGE3, cfg.STAGE3_PREFIX_LEN)
             res = evaluate(model, mods, dataset, dataset["split"]["test"],
@@ -483,6 +532,23 @@ def main():
         out = {"candidate": cand, "screen": bool(args.screen), "epochs": epochs,
                "seed": args.seed, "minutes": mins, "n_dynamics_params": n_dyn,
                "val_loss": val, "test": res, "dataset": ds_path}
+        out.update(fit)                       # best_epoch, epochs_run, stopped_early
+        out["boundary"] = _boundary_hits(model.ode, cand)
+        # Three distinct states, because "not converged" alone is ambiguous:
+        #   settled       -- early-stopped, or best reached before the last epoch
+        #   budget_bound  -- still improving when the budget ran out
+        #   failed        -- never improved, or an exponent never moved
+        # Only `failed` invalidates a candidate's number. `budget_bound` means
+        # every candidate is equally under-trained, which changes the absolute
+        # RMSEs but not their ranking.
+        if fit["best_epoch"] <= 1 or out["boundary"]["n_at_init"] > 0:
+            state = "failed"
+        elif fit["stopped_early"] or fit["best_epoch"] < fit["epochs_run"]:
+            state = "settled"
+        else:
+            state = "budget_bound"
+        out["fit_state"] = state
+        out["converged"] = bool(state == "settled")
         # report learned exponents where the candidate has them
         if hasattr(model.ode, "expG_raw") and cand != "log":
             out["exponents"] = {
