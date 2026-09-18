@@ -146,12 +146,48 @@ def calibrate(all_terms: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
+# Grid used for the robustness sweep. The docstring above quotes "107 of 125"
+# from this sweep; it is computed and written out here so the claim rests on a
+# file rather than on a number typed into a comment.
+WEIGHT_GRID = [0.0, 0.3, 0.62, 1.0, 2.0]
+
+
+def weight_grid_sweep(all_terms, grid=None):
+    """Rank every model under each (lam_tail, lam_ks, lam_cov) in the grid.
+
+    Reports how often each model comes last and how often it comes first. A
+    conclusion that survives the whole grid does not depend on the particular
+    weights chosen, which is the only reason those weights are defensible.
+    """
+    import itertools
+    grid = grid or WEIGHT_GRID
+    models = list(all_terms)
+    last = {m: 0 for m in models}
+    first = {m: 0 for m in models}
+    rows = []
+    for lt, lk, lc in itertools.product(grid, repeat=3):
+        order = sorted(models, key=lambda m: rocc(all_terms[m], lt, lk, lc))
+        first[order[0]] += 1
+        last[order[-1]] += 1
+        rows.append({"lambda_tail": lt, "lambda_ks": lk, "lambda_cov": lc,
+                     "ranking": order})
+    n = len(rows)
+    return {"grid": grid, "n_weightings": n, "combinations": rows,
+            "n_first": first, "n_last": last,
+            "frac_last": {m: last[m] / n for m in models},
+            "frac_first": {m: first[m] / n for m in models}}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Reliability-oriented model selection")
     ap.add_argument("--input", type=str,
                     default=os.path.join(cfg.RESULTS_DIR, "reliability_assessment.json"))
     ap.add_argument("--output", type=str,
                     default=os.path.join(cfg.RESULTS_DIR, "reliability_criterion.json"))
+    ap.add_argument("--weight-grid", action="store_true",
+                    help="sweep the 5x5x5 weight grid and write the robustness file")
+    ap.add_argument("--grid-output", type=str, default=None,
+                    help="where to write the sweep (default: reliability_weight_grid.json)")
     ap.add_argument("--calibrate-weights", action="store_true",
                     help="Re-derive the weights from the current candidate set")
     ap.add_argument("--lam-tail", type=float, default=LAMBDA_TAIL)
@@ -214,6 +250,22 @@ def main():
         log.info("  and its PIT tail deviation %.4f against %.4f -- observations",
                  scored[a]["terms"]["pit_tail_dev"], scored[best]["terms"]["pit_tail_dev"])
         log.info("  sitting outside the interval rather than inside it.")
+
+    if args.weight_grid:
+        sw = weight_grid_sweep(all_terms)
+        log.info("")
+        log.info("WEIGHT-GRID ROBUSTNESS  (%d weightings, lambda in %s)",
+                 sw["n_weightings"], sw["grid"])
+        log.info("%-22s %12s %12s", "model", "ranks first", "ranks last")
+        for m in sorted(all_terms, key=lambda m: -sw["n_last"][m]):
+            log.info("%-22s %7d (%3.0f%%) %7d (%3.0f%%)", m,
+                     sw["n_first"][m], 100 * sw["frac_first"][m],
+                     sw["n_last"][m], 100 * sw["frac_last"][m])
+        gpath = args.grid_output or os.path.join(
+            os.path.dirname(args.output), "reliability_weight_grid.json")
+        with open(gpath, "w", encoding="utf-8") as f:
+            json.dump(sw, f, indent=2)
+        log.info("Saved grid -> %s", gpath)
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump({"weights": {"lambda_tail": lam_tail, "lambda_ks": lam_ks,
