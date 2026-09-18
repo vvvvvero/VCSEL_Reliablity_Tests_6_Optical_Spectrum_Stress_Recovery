@@ -156,6 +156,10 @@ def _to_md_table(rows: List[Dict], cols: List[str]) -> str:
 
 def main():
     p = argparse.ArgumentParser(description="True 2x2 Stage4 alpha x z0 ablation")
+    p.add_argument("--dataset", type=str, default=None,
+                   help="explicit dataset path; the default followed "
+                        "cfg.PROCESSED_DATA_PATH and could pair the wrong "
+                        "feature set with the checkpoint")
     p.add_argument("--checkpoint-stage3", default=os.path.join(cfg.CHECKPOINT_DIR, "stage3_best.pt"))
     p.add_argument("--output-dir", default=os.path.join(cfg.RESULTS_DIR, "stage4_alpha_z0_ablation"))
     p.add_argument("--short-epochs", type=int, default=40)
@@ -201,7 +205,7 @@ def main():
         if hasattr(mods["losses"], lname):
             setattr(mods["train"], lname, getattr(mods["losses"], lname))
 
-    dataset = mods["prep"].load_dataset()
+    dataset = mods["prep"].load_dataset(args.dataset)
     split = dataset["split"]
 
     import torch

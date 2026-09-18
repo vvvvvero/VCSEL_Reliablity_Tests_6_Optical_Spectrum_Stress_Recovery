@@ -68,6 +68,10 @@ def _load(alias: str, fname: str):
 
 def main():
     ap = argparse.ArgumentParser(description="Inference-time observation-window curve")
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="explicit dataset path; the default followed "
+                         "cfg.PROCESSED_DATA_PATH and silently paired the "
+                         "6-feature file with an 11-feature checkpoint")
     ap.add_argument("--checkpoint", type=str,
                     default=os.path.join(cfg.CHECKPOINT_DIR, "stage3_best.pt"))
     ap.add_argument("--windows", type=str, default="2,3,4,5,6,7,8",
@@ -109,7 +113,9 @@ def main():
     model.eval()
     log.info("loaded backbone: %s", args.checkpoint)
 
-    with open(cfg.PROCESSED_DATA_PATH, "rb") as f:
+    ds_path = args.dataset or cfg.PROCESSED_DATA_PATH
+    log.info("dataset %s", os.path.basename(ds_path))
+    with open(ds_path, "rb") as f:
         dataset = pickle.load(f)
     if args.split == "all":
         idx = list(range(len(dataset["device_ids"])))

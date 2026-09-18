@@ -80,12 +80,16 @@ import config as cfg
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 
-LATENT_NAMES = ["zG", "zB", "zM", "zL", "zC"]
+# Taken from config, not hard-coded: this file was written for the 5-latent
+# model and crashed with an IndexError once zF was added, because the decoder
+# had six columns and this list still had five names.
+LATENT_NAMES = list(cfg.LATENT_NAMES)
 
 # Rows carrying the main-channel signal. IDLeak/IGLeak are excluded: they have
 # a different (leakage) mask, and in this dataset they are zero-variance and
 # not generated, so including them would dilute the measurement.
-MAIN_ROWS = [0, 1, 2, 3]
+MAIN_ROWS = [cfg.FEATURES.index(f) for f in ("Vth", "IDSS", "RON", "gmmax")
+             if f in cfg.FEATURES]
 
 # Substitutability residual, as a fraction of the column norm, below which a
 # latent's effect is considered reproducible by the others.
