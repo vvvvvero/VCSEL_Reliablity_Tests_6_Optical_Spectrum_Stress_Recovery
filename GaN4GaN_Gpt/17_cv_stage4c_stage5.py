@@ -186,6 +186,10 @@ def main():
     ap = argparse.ArgumentParser(description="Multi-seed grouped-CV validation of Stage 4C vs Stage 5")
     ap.add_argument("--seeds", type=str, default="0,1,2")
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="explicit dataset path; the default followed "
+                         "cfg.PROCESSED_DATA_PATH, which silently kept these "
+                         "runs on the unfiltered 203-device file")
     ap.add_argument("--stage3-ckpt", type=str,
                     default=os.path.join(cfg.CHECKPOINT_DIR, "stage3_best.pt"))
     ap.add_argument("--output-dir", type=str,
@@ -218,7 +222,9 @@ def main():
     mods = stage4a._load_all()
     train_mod = mods["train"]
 
-    with open(cfg.PROCESSED_DATA_PATH, "rb") as f:
+    ds_path = args.dataset or cfg.PROCESSED_DATA_PATH
+    log.info("dataset %s", os.path.basename(ds_path))
+    with open(ds_path, "rb") as f:
         dataset = pickle.load(f)
     device_types = dataset.get("device_types")
     if device_types is None:
@@ -357,7 +363,12 @@ def main():
                      f"{row.get('s5_crps', float('nan')):.5f}", f"{row.get('s5_cov90', float('nan')):.4f}")
 
     # ── Aggregate ───────────────────────────────────────────────────────────
-    summary: Dict = {"seeds": seeds, "folds": args.folds, "n_runs": len(rows),
+    # Record the dataset and device count in the summary. Their absence is why
+    # these runs sat on the unfiltered 203-device file unnoticed: nothing in the
+    # output said which data produced them.
+    summary: Dict = {"dataset": os.path.basename(ds_path),
+                     "n_devices": len(dataset["device_ids"]),
+                     "seeds": seeds, "folds": args.folds, "n_runs": len(rows),
                      "elapsed_s": time.time() - t_start}
     s4c_crps_all = np.array([r["s4c_crps"] for r in rows if np.isfinite(r["s4c_crps"])])
     summary["s4c_crps_mean"] = float(s4c_crps_all.mean())

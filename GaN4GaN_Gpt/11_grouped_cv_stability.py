@@ -12,6 +12,35 @@ Outputs (under --output-dir):
 - grouped_cv_model_summary.csv
 - grouped_cv_seed_summary.csv
 - grouped_cv_stability.pkl
+
+STATUS (2026-09): these results are from the PREVIOUS architecture
+------------------------------------------------------------------
+Every grouped_cv_* directory on disk was produced in early August against the
+6-feature / 5-latent model, with a Stage 4 latent-space generator
+(checkpoints/stage4_best.pt, 31 July). Its decoder.W_raw is 6x5; the current
+model's is 11x6. Loading a current Stage 3 checkpoint into this script fails
+with a shape mismatch, which is the honest signal that the runs are not
+comparable with anything else in the pipeline.
+
+They are also on the wrong data: folds sum to 202 devices, i.e. the unfiltered
+203-device set less one device with too few observations, while the rest of the
+pipeline moved to the filtered 200.
+
+These cannot simply be rerun. The comparison this script performs -- AR(1) and
+Gaussian baselines against a Stage 4 LATENT-space generator -- has no current
+counterpart: the pipeline replaced that generator with Stage 4C in observation
+space (14_), and no Stage 4 checkpoint exists for the 11-feature architecture.
+
+What replaced it, and where the current numbers live:
+  * Stage 4C vs Stage 5, grouped 5-fold x 3 seeds, filtered data
+        17_cv_stage4c_stage5.py
+        results/cv_stage4c_stage5_filtered/
+  * Stage 4C calibration on the filtered backbone
+        ext11_filtered/stage4c/results/
+
+--dataset is added below so a future run cannot silently inherit
+cfg.PROCESSED_DATA_PATH again, and every fold row now carries the dataset name
+and device count.
 """
 
 import argparse
@@ -713,6 +742,10 @@ def _write_csv(path: str, rows: List[Dict], fieldnames: List[str]):
 
 def main():
     p = argparse.ArgumentParser(description="Grouped 5-fold x multi-seed stability validation")
+    p.add_argument("--dataset", type=str, default=None,
+                   help="explicit dataset path; the default followed "
+                        "cfg.PROCESSED_DATA_PATH, which kept these runs on the "
+                        "unfiltered file after the pipeline moved on")
     p.add_argument("--checkpoint-stage3", default=os.path.join(cfg.CHECKPOINT_DIR, "stage3_best.pt"))
     p.add_argument("--checkpoint-stage4", default=os.path.join(cfg.CHECKPOINT_DIR, "stage4_best.pt"))
     p.add_argument("--checkpoint-stage4b", type=str, default="")
@@ -763,7 +796,7 @@ def main():
         "stage4b": _load_module("_pi_stage4b_cv", "14_stage4b_ar1_guided_generator.py"),
     }
 
-    dataset = mods["prep"].load_dataset()
+    dataset = mods["prep"].load_dataset(args.dataset)
     eval_indices = _select_eval_indices(dataset, args.split_scope)
 
     if not os.path.exists(args.checkpoint_stage3):
@@ -1316,6 +1349,15 @@ def main():
         "n_comparisons_vs_gaussian": tot_vs_gauss,
         "n_comparisons_vs_stage4": tot_vs_stage4,
     }
+
+    # Stamp the dataset onto every fold row. Its absence is why these runs sat
+    # on the unfiltered file unnoticed: nothing in the CSV said which data
+    # produced them.
+    _ds_name = os.path.basename(args.dataset or cfg.PROCESSED_DATA_PATH)
+    _n_dev = len(dataset["device_ids"])
+    for _r in fold_rows:
+        _r["dataset"] = _ds_name
+        _r["n_devices_total"] = _n_dev
 
     fold_csv = os.path.join(args.output_dir, "grouped_cv_fold_metrics.csv")
     model_csv = os.path.join(args.output_dir, "grouped_cv_model_summary.csv")
