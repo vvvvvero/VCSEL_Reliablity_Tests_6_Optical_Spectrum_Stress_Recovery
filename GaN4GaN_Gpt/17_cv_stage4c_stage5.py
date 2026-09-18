@@ -182,10 +182,88 @@ def _paired_stats(diff: np.ndarray, n_boot: int = 10000, seed: int = 0) -> Dict:
     return out
 
 
+def _device_clustered_stats(per_device, n_boot=20000, seed=0):
+    """Paired statistics whose independent unit is the PHYSICAL DEVICE.
+
+    The pooled test treats every (seed, device) row as its own observation. One
+    device measured under S seeds is not S independent samples: the seeds share
+    the device's degradation trajectory, so the pooled interval is narrower
+    than the evidence supports.
+
+    Two estimates are reported.
+
+      device_mean   Average the per-seed differences within each device first
+                    (d_bar_i), then bootstrap over the N unique devices. The
+                    resampling unit is the device, and N is the true sample
+                    size.
+
+      hierarchical  Resample seeds with replacement, then devices within each
+                    resampled seed. This propagates seed-to-seed variation as
+                    well as device-to-device variation, and is the more
+                    conservative of the two.
+
+    A Wilcoxon test on d_bar_i is also reported: unlike the pooled version it
+    has one observation per device, so its n is the device count.
+    """
+    import collections
+    from scipy import stats as _st
+
+    by_dev = collections.defaultdict(list)
+    for r in per_device:
+        by_dev[r["device_id"]].append(r["diff"])
+    ids = sorted(by_dev)
+    d_bar = np.array([float(np.mean(by_dev[i])) for i in ids])
+    n_dev = len(ids)
+    rng = np.random.default_rng(seed)
+
+    # --- device-level bootstrap -------------------------------------------
+    boot = np.array([d_bar[rng.integers(0, n_dev, n_dev)].mean()
+                     for _ in range(n_boot)])
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+
+    try:
+        w_p = float(_st.wilcoxon(d_bar).pvalue) if np.any(d_bar != 0) else 1.0
+    except Exception:                                    # noqa: BLE001
+        w_p = float("nan")
+
+    out = {"unit": "device", "n_devices": int(n_dev),
+           "n_rows_pooled": int(len(per_device)),
+           "mean": float(d_bar.mean()), "std": float(d_bar.std(ddof=1)),
+           "median": float(np.median(d_bar)),
+           "frac_positive": float((d_bar > 0).mean()),
+           "ci_low": float(lo), "ci_high": float(hi),
+           "wilcoxon_p": w_p,
+           "significant": bool(lo > 0 or hi < 0)}
+
+    # --- hierarchical bootstrap: seeds, then devices within seed ----------
+    by_seed = collections.defaultdict(lambda: collections.defaultdict(list))
+    for r in per_device:
+        by_seed[r["seed"]][r["device_id"]].append(r["diff"])
+    seeds_list = sorted(by_seed)
+    if len(seeds_list) > 1:
+        hb = []
+        for _ in range(n_boot // 4):          # costlier per draw
+            acc = []
+            for sd in rng.choice(seeds_list, len(seeds_list), replace=True):
+                devs = list(by_seed[sd])
+                pick = rng.integers(0, len(devs), len(devs))
+                acc.extend(float(np.mean(by_seed[sd][devs[k]])) for k in pick)
+            hb.append(float(np.mean(acc)))
+        hb = np.array(hb)
+        hlo, hhi = np.percentile(hb, [2.5, 97.5])
+        out["hierarchical"] = {"ci_low": float(hlo), "ci_high": float(hhi),
+                               "mean": float(hb.mean()),
+                               "n_seeds": len(seeds_list),
+                               "significant": bool(hlo > 0 or hhi < 0)}
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="Multi-seed grouped-CV validation of Stage 4C vs Stage 5")
     ap.add_argument("--seeds", type=str, default="0,1,2")
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--n-boot", type=int, default=20000,
+                    help="bootstrap draws for the device-clustered interval")
     ap.add_argument("--dataset", type=str, default=None,
                     help="explicit dataset path; the default followed "
                          "cfg.PROCESSED_DATA_PATH, which silently kept these "
@@ -245,6 +323,7 @@ def main():
     from torch.utils.data import DataLoader
     rows: List[Dict] = []
     paired_crps: List[np.ndarray] = []
+    per_device: List[Dict] = []
     s4c_cov_hits, s4c_cov_tot = [], []
     s5_cov_hits, s5_cov_tot = [], []
 
@@ -354,6 +433,18 @@ def main():
                 row["s5_cov90"] = float(h5.sum() / max(t5.sum(), 1)) if len(c5) else float("nan")
                 if len(c4) and len(c5) and len(c4) == len(c5):
                     paired_crps.append(c4 - c5)   # positive => Stage 5 better
+                    # Keep device identity with the difference. Pooling
+                    # (seed, device) rows as if independent treats one physical
+                    # device measured under S seeds as S samples, inflating the
+                    # effective sample size; the device-clustered bootstrap
+                    # needs these ids to resample devices instead.
+                    for _k, _ti in enumerate(test_idx):
+                        per_device.append({
+                            "device_id": str(dataset["device_ids"][int(_ti)]),
+                            "device_index": int(_ti), "seed": int(seed),
+                            "fold": int(fi),
+                            "s4c_crps": float(c4[_k]), "s5_crps": float(c5[_k]),
+                            "diff": float(c4[_k] - c5[_k])})
                     s5_cov_hits.append(h5); s5_cov_tot.append(t5)
 
             s4c_cov_hits.append(h4); s4c_cov_tot.append(t4)
@@ -387,11 +478,31 @@ def main():
         summary["s5_cov90_mean"] = float(s5_cov_all.mean())
         summary["s5_cov90_std"]  = float(s5_cov_all.std())
         summary["n_folds_stage5_saved"] = int(sum(1 for r in rows if r.get("s5_saved")))
+        if per_device:
+            summary["paired_crps_device_clustered"] = _device_clustered_stats(
+                per_device, n_boot=args.n_boot)
 
+    with open(os.path.join(args.output_dir, "cv_per_device.json"), "w") as f:
+        json.dump(per_device, f, indent=2, default=str)
     with open(os.path.join(args.output_dir, "cv_rows.json"), "w") as f:
         json.dump(rows, f, indent=2, default=str)
     with open(os.path.join(args.output_dir, "cv_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=str)
+
+    dc = summary.get("paired_crps_device_clustered")
+    if dc:
+        log.info("")
+        log.info("DEVICE-CLUSTERED paired CRPS (S4C - S5), unit = physical device")
+        log.info("  n_devices=%d (pooled rows=%d)  mean=%+.6f  median=%+.6f",
+                 dc["n_devices"], dc["n_rows_pooled"], dc["mean"], dc["median"])
+        log.info("  device bootstrap 95%% CI = [%+.6f, %+.6f]  wilcoxon p=%.4f  -> %s",
+                 dc["ci_low"], dc["ci_high"], dc["wilcoxon_p"],
+                 "SIGNIFICANT" if dc["significant"] else "NOT SIGNIFICANT")
+        h = dc.get("hierarchical")
+        if h:
+            log.info("  hierarchical (seeds then devices) CI = [%+.6f, %+.6f] -> %s",
+                     h["ci_low"], h["ci_high"],
+                     "SIGNIFICANT" if h["significant"] else "NOT SIGNIFICANT")
 
     log.info("=" * 70)
     log.info("RESULTS over %d runs (%d seeds x %d folds)", len(rows), len(seeds), args.folds)
