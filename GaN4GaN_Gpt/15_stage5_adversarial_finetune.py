@@ -456,7 +456,14 @@ def train_stage5(
                 continue
 
             # Generate samples
-            deltas = generator.sample_n(z_pfx, T_K, x0, log_t, n_train_samples, T_future=T_future)
+            # rho_eff is log-time adjusted only when times_future is passed;
+            # without it the AR(1) uses one fixed rho for every forecast step,
+            # so Stage 5 would train against a different process than Stage 4C.
+            t_f = rec["times"][:, plen:].to(device) if "times" in rec else None
+            kw_t = ({'times_future': t_f}
+                    if t_f is not None and hasattr(generator, 'LOG10_T_REF') else {})
+            deltas = generator.sample_n(z_pfx, T_K, x0, log_t, n_train_samples,
+                                        T_future=T_future, **kw_t)
             # deltas: (S, B, T_future, F_gen)  where F_gen=4 for stable, 6 for full
 
             # ── Discriminator step ──────────────────────────────────────────
@@ -571,7 +578,11 @@ def train_stage5(
                 T_future= rec["T_len"] - plen
                 if T_future <= 0:
                     continue
-                deltas_v = generator.sample_n(z_pfx, T_K, x0, log_t, n_val_samples, T_future=T_future)
+                t_fv = rec["times"][:, plen:].to(device) if "times" in rec else None
+                kw_tv = ({'times_future': t_fv}
+                         if t_fv is not None and hasattr(generator, 'LOG10_T_REF') else {})
+                deltas_v = generator.sample_n(z_pfx, T_K, x0, log_t, n_val_samples,
+                                              T_future=T_future, **kw_tv)
                 if is_stable_gen:
                     sfx_v = torch.tensor(STABLE_IDX, device=device)
                     x_pf  = x_hat[:, plen:, :][:, :, sfx_v].unsqueeze(0) + deltas_v
@@ -864,7 +875,11 @@ def main():
             T_future= rec["T_len"] - plen
             if T_future <= 0:
                 continue
-            deltas  = gen4b.sample_n(z_pfx, T_K, x0, log_t, N_VAL_SAMPLES, T_future=T_future)
+            t_fe = rec["times"][:, plen:].to(device) if "times" in rec else None
+            kw_te = ({'times_future': t_fe}
+                     if t_fe is not None and hasattr(gen4b, 'LOG10_T_REF') else {})
+            deltas  = gen4b.sample_n(z_pfx, T_K, x0, log_t, N_VAL_SAMPLES,
+                                     T_future=T_future, **kw_te)
             if is_stable_ckpt:
                 _sfx = torch.tensor(STABLE_IDX, device=device)
                 x_f  = x_hat[:, plen:, :][:, :, _sfx].unsqueeze(0) + deltas
