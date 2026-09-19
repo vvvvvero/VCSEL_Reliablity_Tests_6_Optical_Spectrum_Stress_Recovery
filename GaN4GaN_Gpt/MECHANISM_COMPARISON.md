@@ -252,18 +252,74 @@ These remain fitted values of a *losing* model, so they should not be quoted
 as measured GaN dispersion exponents; their interest is that the alternatives
 were genuinely optimised, which is what makes the comparison fair.
 
+## Superseded: the 41 % figure was measured on the wrong dataset
+
+Everything above ran on `processed_data_ext.pkl`, the UNFILTERED 203-device
+set. `25_` hard-coded that path and ignored the configuration override, so
+those runs stayed on data the rest of the pipeline had already left behind
+when the three measurement-fault devices were removed. The script now takes an
+explicit `--dataset`.
+
+It was also rerun on four seeds rather than two, and then again at double the
+epoch budget, because every run was budget-bound at 200 epochs and a ranking
+produced under a budget nobody has escaped is a ranking that might be measuring
+optimisation speed.
+
+### Four seeds, filtered data, 200 vs 400 epochs
+
+| candidate | 200 ep | 400 ep | improvement | rank 200 | rank 400 |
+|---|---|---|---|---|---|
+| **SRH** | 0.2006 ± 0.0039 | **0.1799 ± 0.0043** | 10.3 % | **1** | **1** |
+| Power law | 0.2879 ± 0.0065 | 0.2470 ± 0.0123 | 14.2 % | 3 | **2** |
+| Stretched exp. | 0.2868 ± 0.0037 | 0.2673 ± 0.0051 | 6.8 % | 2 | **3** |
+| Log creep | 0.3901 ± 0.0162 | 0.3600 ± 0.0083 | 7.7 % | 4 | 4 |
+
+Per-seed winner is SRH in 4/4 seeds under **both** budgets. Spearman rho
+between the two rankings is +0.800: the only change is second and third
+swapping places.
+
+### What doubling the budget showed
+
+**The SRH preference is persistent, not an artefact of optimisation rate.**
+Its margin over the closest rival moves only from 30.0 % to 27.2 %, and the
+ranges still do not overlap — SRH [0.1759, 0.1845] against power law
+[0.2351, 0.2624], a gap of 0.0507, about 27 % of SRH's own worst value. This
+is the question the extended run was designed to answer, and the answer is
+that the mechanism preference holds.
+
+**Second place is NOT a mechanism result and must not be reported as one.**
+Power law improves most (14.2 %) and overtakes stretched-exponential, which
+improves least (6.8 %). Under the 200-epoch budget the ordering of those two
+reflected how fast each was still descending, not which fits the data better.
+Having flipped once, it can flip again.
+
+**All sixteen runs at 400 epochs are still budget-bound.** `best_epoch` is
+400.0 ± 0.0 for every candidate: none converged, none early-stopped, and every
+one was still improving when the budget ran out. The ranking is safe because
+all four are under-trained by the same budget, but the absolute RMSEs are not
+converged values and must be described as such.
+
 ## Conclusion
 
-With a matched budget, matched solver class, honest parameter counts and two
-seeds, **the data prefer Shockley-Read-Hall kinetics over power-law,
-stretched-exponential and logarithmic-creep rate laws** — by 41 % in test RMSE
-over the closest alternative, consistently across seeds.
+With a matched budget, matched solver class, honest parameter counts and
+**four seeds on the filtered 200-device dataset**, the data prefer
+Shockley-Read-Hall kinetics over power-law, stretched-exponential and
+logarithmic-creep rate laws — by **27.2 %** in test RMSE over the closest
+alternative at 400 epochs (30.0 % at 200), winning every seed under both
+budgets, with non-overlapping ranges.
 
 This upgrades the pipeline's SRH choice from an assumption to a measurement,
 and complements the separate finding that the physics prior as a whole beats
-free-form dynamics by 13.2 % (4 seeds, CI [-16.3, -10.2]).
+free-form dynamics by 8.93 % against a Neural ODE and 23.01 % against a GRU
+(4 seeds, filtered data, CIs excluding zero).
 
-Caveat for a write-up: two seeds support a 41 % gap comfortably, but the
-absolute RMSEs are not converged values, and the comparison covers the
-reversible trap states only — zM, zL and zC keep their saturating-drift form
-in every candidate and were never in dispute.
+Caveats for a write-up:
+
+* absolute RMSEs are not converged — every run is budget-bound even at 400
+  epochs, so report the ranking and the separation, not the values;
+* the second/third ordering changed between budgets and should not be quoted;
+* the comparison covers the reversible trap states only — zM, zL and zC keep
+  their saturating-drift form in every candidate and were never in dispute;
+* with four seeds the exact two-sided Wilcoxon p is bounded below by 0.125, so
+  the evidence is the effect size, the disjoint ranges and 4/4 directional
+  consistency, not a rank test.
