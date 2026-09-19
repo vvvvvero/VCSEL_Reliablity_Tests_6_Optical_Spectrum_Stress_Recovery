@@ -730,6 +730,10 @@ def train_stage5(
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Stage 5: adversarial fine-tuning of Stage 4B")
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="explicit dataset path; the default followed "
+                         "cfg.PROCESSED_DATA_PATH and paired the 6-feature "
+                         "file with an 11-feature checkpoint")
     ap.add_argument("--checkpoint-stage3",  required=True)
     ap.add_argument("--checkpoint-stage4b", required=True)
     ap.add_argument("--output-dir",         required=True)
@@ -834,7 +838,7 @@ def main():
     _cache_trajectories = mods["_s5_stage4b"]._cache_trajectories
     _forward = mods["_s5_train"]._forward
 
-    dataset   = mods["_s5_prep"].load_dataset()
+    dataset   = mods["_s5_prep"].load_dataset(args.dataset)
     from torch.utils.data import DataLoader
     train_ds = mods["_s5_train"].DeviceDegradationDataset(dataset, dataset["split"]["train"])
     val_ds   = mods["_s5_train"].DeviceDegradationDataset(dataset, dataset["split"]["val"])

@@ -122,6 +122,7 @@ def _per_device_metrics(s4b_mod, generator, model, dataset, indices, train_mod,
     sfx = torch.tensor(SI, device=device)
 
     crps_out, cov_hits, cov_tot = [], [], []
+    feat_hits, feat_tot, simul = [], [], []
     generator.eval()
     with torch.no_grad():
         for rec in cache:
@@ -150,11 +151,28 @@ def _per_device_metrics(s4b_mod, generator, model, dataset, indices, train_mod,
             cov_hits.append(inside.sum(dim=(1, 2)).cpu().numpy())
             cov_tot.append(valid.sum(dim=(1, 2)).cpu().numpy())
 
+            # Per-FEATURE cells, kept separately so a coverage loss can be
+            # attributed to the feature that caused it rather than only seen
+            # in the pooled rate.
+            feat_hits.append(inside.sum(dim=1).cpu().numpy())    # (B, F)
+            feat_tot.append(valid.sum(dim=1).cpu().numpy())      # (B, F)
+
+            # SIMULTANEOUS trajectory coverage: the whole future trajectory of
+            # a device lies inside its band. Pointwise coverage at 90 % says
+            # nothing about whether a single device is covered everywhere at
+            # once, which is what a qualification decision actually needs.
+            all_in = ((inside | ~valid).all(dim=2).all(dim=1))
+            simul.append(all_in.cpu().numpy())
+
     if not crps_out:
-        return np.array([]), np.array([]), np.array([])
+        z = np.array([])
+        return z, z, z, np.zeros((0, len(SI))), np.zeros((0, len(SI))), z
     return (np.concatenate(crps_out),
             np.concatenate(cov_hits).astype(float),
-            np.concatenate(cov_tot).astype(float))
+            np.concatenate(cov_tot).astype(float),
+            np.concatenate(feat_hits).astype(float),
+            np.concatenate(feat_tot).astype(float),
+            np.concatenate(simul).astype(float))
 
 
 def _paired_stats(diff: np.ndarray, n_boot: int = 10000, seed: int = 0) -> Dict:
@@ -256,6 +274,67 @@ def _device_clustered_stats(per_device, n_boot=20000, seed=0):
                                "n_seeds": len(seeds_list),
                                "significant": bool(hlo > 0 or hhi < 0)}
     return out
+
+
+def _device_clustered_coverage(per_device, n_boot=20000, seed=0):
+    """Paired coverage change, clustered on the physical device.
+
+    The fold table shows Stage 5's Cov90 below Stage 4C's in every fold, but a
+    count of folds is not an interval: it says the direction is consistent
+    without saying how large the loss is or how well determined. This applies
+    the same clustering used for CRPS -- average each device's per-seed
+    coverage first, then bootstrap over devices -- so the coverage claim and
+    the CRPS claim rest on the same inferential unit.
+
+    Simultaneous coverage is reported alongside the pointwise rate because a
+    qualification decision needs the probability that a device's WHOLE
+    trajectory stays inside its band, which a pointwise rate near 0.90 can
+    hide.
+    """
+    import collections
+    from scipy import stats as _st
+
+    by_dev = collections.defaultdict(list)
+    by_dev_sim = collections.defaultdict(list)
+    for r in per_device:
+        if np.isfinite(r.get("cov_diff", float("nan"))):
+            by_dev[r["device_id"]].append(r["cov_diff"])
+        by_dev_sim[r["device_id"]].append(
+            (r.get("s4c_simultaneous", 0.0), r.get("s5_simultaneous", 0.0)))
+    if not by_dev:
+        return None
+    ids = sorted(by_dev)
+    d_bar = np.array([float(np.mean(by_dev[i])) for i in ids])
+    n_dev = len(ids)
+    rng = np.random.default_rng(seed)
+    boot = np.array([d_bar[rng.integers(0, n_dev, n_dev)].mean()
+                     for _ in range(n_boot)])
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    try:
+        w_p = float(_st.wilcoxon(d_bar).pvalue) if np.any(d_bar != 0) else 1.0
+    except Exception:                                    # noqa: BLE001
+        w_p = float("nan")
+
+    sim4 = np.array([np.mean([a for a, _ in by_dev_sim[i]]) for i in ids])
+    sim5 = np.array([np.mean([b for _, b in by_dev_sim[i]]) for i in ids])
+    sdiff = sim4 - sim5
+    sboot = np.array([sdiff[rng.integers(0, n_dev, n_dev)].mean()
+                      for _ in range(n_boot)])
+    slo, shi = np.percentile(sboot, [2.5, 97.5])
+
+    return {"unit": "device", "n_devices": int(n_dev),
+            "pointwise": {
+                "mean_cov_change_s4c_minus_s5": float(d_bar.mean()),
+                "median": float(np.median(d_bar)),
+                "frac_devices_s4c_higher": float((d_bar > 0).mean()),
+                "ci_low": float(lo), "ci_high": float(hi),
+                "wilcoxon_p": w_p,
+                "significant": bool(lo > 0 or hi < 0)},
+            "simultaneous": {
+                "s4c_rate": float(sim4.mean()), "s5_rate": float(sim5.mean()),
+                "mean_change": float(sdiff.mean()),
+                "ci_low": float(slo), "ci_high": float(shi),
+                "significant": bool(slo > 0 or shi < 0)}}
 
 
 def main():
@@ -369,7 +448,7 @@ def main():
             s4c_path = os.path.join(fold_ckpt_dir, "stage4b_best.pt")
             gen4c.load_state_dict(torch.load(s4c_path, map_location=device)["state_dict"])
 
-            c4, h4, t4 = _per_device_metrics(s4b, gen4c, model, dataset, test_idx,
+            c4, h4, t4, fh4, ft4, sim4 = _per_device_metrics(s4b, gen4c, model, dataset, test_idx,
                                               train_mod, device, args.n_eval_samples)
 
             row = {"seed": seed, "fold": fi, "n_test": int(len(c4)),
@@ -427,7 +506,7 @@ def main():
                     row["s5_saved"] = False
                     log.warning("  seed=%d fold=%d: Stage 5 saved no checkpoint (all guards failed)", seed, fi)
 
-                c5, h5, t5 = _per_device_metrics(s4b, gen5, model, dataset, test_idx,
+                c5, h5, t5, fh5, ft5, sim5 = _per_device_metrics(s4b, gen5, model, dataset, test_idx,
                                                   train_mod, device, args.n_eval_samples)
                 row["s5_crps"] = float(np.mean(c5)) if len(c5) else float("nan")
                 row["s5_cov90"] = float(h5.sum() / max(t5.sum(), 1)) if len(c5) else float("nan")
@@ -439,12 +518,25 @@ def main():
                     # effective sample size; the device-clustered bootstrap
                     # needs these ids to resample devices instead.
                     for _k, _ti in enumerate(test_idx):
+                        _cov4 = float(h4[_k] / t4[_k]) if t4[_k] > 0 else float("nan")
+                        _cov5 = float(h5[_k] / t5[_k]) if t5[_k] > 0 else float("nan")
                         per_device.append({
                             "device_id": str(dataset["device_ids"][int(_ti)]),
                             "device_index": int(_ti), "seed": int(seed),
                             "fold": int(fi),
                             "s4c_crps": float(c4[_k]), "s5_crps": float(c5[_k]),
-                            "diff": float(c4[_k] - c5[_k])})
+                            "diff": float(c4[_k] - c5[_k]),
+                            # calibration, at the granularities a paired
+                            # coverage interval needs
+                            "n_cells": int(t4[_k]),
+                            "s4c_cov90": _cov4, "s5_cov90": _cov5,
+                            "cov_diff": _cov4 - _cov5,
+                            "s4c_cov90_by_feature": [float(a / b) if b > 0 else float("nan")
+                                                     for a, b in zip(fh4[_k], ft4[_k])],
+                            "s5_cov90_by_feature": [float(a / b) if b > 0 else float("nan")
+                                                    for a, b in zip(fh5[_k], ft5[_k])],
+                            "s4c_simultaneous": float(sim4[_k]),
+                            "s5_simultaneous": float(sim5[_k])})
                     s5_cov_hits.append(h5); s5_cov_tot.append(t5)
 
             s4c_cov_hits.append(h4); s4c_cov_tot.append(t4)
@@ -481,6 +573,9 @@ def main():
         if per_device:
             summary["paired_crps_device_clustered"] = _device_clustered_stats(
                 per_device, n_boot=args.n_boot)
+            _cov = _device_clustered_coverage(per_device, n_boot=args.n_boot)
+            if _cov:
+                summary["paired_coverage_device_clustered"] = _cov
 
     with open(os.path.join(args.output_dir, "cv_per_device.json"), "w") as f:
         json.dump(per_device, f, indent=2, default=str)
@@ -503,6 +598,22 @@ def main():
             log.info("  hierarchical (seeds then devices) CI = [%+.6f, %+.6f] -> %s",
                      h["ci_low"], h["ci_high"],
                      "SIGNIFICANT" if h["significant"] else "NOT SIGNIFICANT")
+
+    cv = summary.get("paired_coverage_device_clustered")
+    if cv:
+        pw, sm = cv["pointwise"], cv["simultaneous"]
+        log.info("")
+        log.info("DEVICE-CLUSTERED paired Cov90 change (S4C - S5), n=%d devices",
+                 cv["n_devices"])
+        log.info("  pointwise    mean=%+.5f  95%% CI=[%+.5f, %+.5f]  p=%.4f  -> %s",
+                 pw["mean_cov_change_s4c_minus_s5"], pw["ci_low"], pw["ci_high"],
+                 pw["wilcoxon_p"],
+                 "SIGNIFICANT" if pw["significant"] else "NOT SIGNIFICANT")
+        log.info("  S4C higher on %.1f%% of devices", 100 * pw["frac_devices_s4c_higher"])
+        log.info("  simultaneous S4C=%.4f S5=%.4f  change=%+.5f  CI=[%+.5f, %+.5f] -> %s",
+                 sm["s4c_rate"], sm["s5_rate"], sm["mean_change"],
+                 sm["ci_low"], sm["ci_high"],
+                 "SIGNIFICANT" if sm["significant"] else "NOT SIGNIFICANT")
 
     log.info("=" * 70)
     log.info("RESULTS over %d runs (%d seeds x %d folds)", len(rows), len(seeds), args.folds)

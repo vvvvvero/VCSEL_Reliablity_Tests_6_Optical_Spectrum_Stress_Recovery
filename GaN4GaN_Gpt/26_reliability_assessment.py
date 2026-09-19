@@ -243,14 +243,26 @@ def main():
                     default="stage4c,stage4c_offset,stage4c_sigma",
                     help="Stage 4C run directories under ext11/")
     ap.add_argument("--compare-stage5", action="store_true")
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="explicit dataset path; the default hard-coded the "
+                         "unfiltered processed_data_ext.pkl")
+    ap.add_argument("--ext-dir", type=str, default=None,
+                    help="backbone directory holding the run subdirectories "
+                         "(default: ext11, the pre-filter backbone)")
     ap.add_argument("--n-samples", type=int, default=N_SAMPLES)
     ap.add_argument("--split", type=str, default="test")
     ap.add_argument("--output", type=str,
                     default=os.path.join(cfg.RESULTS_DIR, "reliability_assessment.json"))
     args = ap.parse_args()
 
-    cfg.PROCESSED_DATA_PATH = os.path.join(cfg.OUTPUT_PATH, "processed_data_ext.pkl")
+    global EXT_DIR
+    if args.ext_dir:
+        EXT_DIR = args.ext_dir
+    cfg.PROCESSED_DATA_PATH = args.dataset or os.path.join(
+        cfg.OUTPUT_PATH, "processed_data_ext.pkl")
     cfg.CHECKPOINT_DIR = os.path.join(EXT_DIR, "checkpoints")
+    log.info("dataset  %s", os.path.basename(cfg.PROCESSED_DATA_PATH))
+    log.info("backbone %s", EXT_DIR)
 
     s4b = _load("_ra_s4b", "14_stage4b_ar1_guided_generator.py")
     s4a = s4b.stage4a_mod
@@ -282,7 +294,8 @@ def main():
     if args.compare_stage5:
         jobs.append(("stage5", True))
 
-    results = {}
+    results = {"_meta": {"dataset": os.path.basename(cfg.PROCESSED_DATA_PATH),
+                         "ext_dir": EXT_DIR}}
     for run, is_s5 in jobs:
         gen = build(run, s4b, s4a, mods, model, device, stage5=is_s5)
         if gen is None:
@@ -302,6 +315,8 @@ def main():
     log.info("WINKLER INTERVAL SCORE at %d%% (lower is better; a miss costs 20x)", lvl)
     log.info("%-22s" % "run" + "".join(f"{int((1-a)*100):>12}%" for a in ALPHAS))
     for run, r in results.items():
+        if run.startswith("_"):
+            continue
         o = r["overall"]
         log.info("%-22s" % run
                  + "".join(f"{o.get(f'winkler_{int((1-a)*100)}', float('nan')):>13.4f}"
@@ -310,6 +325,8 @@ def main():
     log.info("COVERAGE (nominal 50 / 80 / 90)")
     log.info("%-22s" % "run" + "".join(f"{int((1-a)*100):>12}%" for a in ALPHAS))
     for run, r in results.items():
+        if run.startswith("_"):
+            continue
         o = r["overall"]
         log.info("%-22s" % run
                  + "".join(f"{o.get(f'cov_{int((1-a)*100)}', float('nan')):>13.4f}"
@@ -318,6 +335,8 @@ def main():
     log.info("PIT — departure from uniformity (KS distance; lower is better)")
     log.info("%-22s %10s %12s   %s", "run", "KS", "tail mass", "diagnosis")
     for run, r in results.items():
+        if run.startswith("_"):
+            continue
         o = r["overall"]
         log.info("%-22s %10.4f %12.4f   %s", run, o.get("pit_ks", float("nan")),
                  o.get("pit_tail_mass", float("nan")), o.get("pit_shape", "-"))
@@ -326,6 +345,8 @@ def main():
     log.info("")
     log.info("PIT HISTOGRAM, 10 bins — flat is calibrated")
     for run, r in results.items():
+        if run.startswith("_"):
+            continue
         h = r["overall"].get("pit_hist", [])
         bars = " ".join(f"{v:.3f}" for v in h)
         log.info("  %-20s %s", run, bars)
