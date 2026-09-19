@@ -196,12 +196,23 @@ def main():
     # trajectory. Done on the FULL arrays before the device filter so the
     # reported counts match the retained set.
     FM_new = FM.copy()
+    # Censoring is DIRECTIONAL and that direction is information: a reading
+    # pinned at +c says the true value was at least c, not that it is unknown.
+    # Dropping the point discards that. These arrays record which cells were
+    # censored and on which side, so a likelihood-based treatment (see 38_)
+    # can use P(Y >= c) or P(Y <= c) instead of removing the observation.
+    cens_upper = np.zeros_like(FM, dtype=bool)
+    cens_lower = np.zeros_like(FM, dtype=bool)
     n_masked = 0
     if not args.no_mask_clipped:
         keep_set = set(keep)
         for f, name in enumerate(cfg.FEATURES):
             bound = CLIP_BOUNDS.get(name, DEFAULT_CLIP)
-            hit = (np.abs(np.abs(X[:, :, f]) - bound) < CLIP_TOL) & FM[:, :, f] & MK
+            hit_hi = (np.abs(X[:, :, f] - bound) < CLIP_TOL) & FM[:, :, f] & MK
+            hit_lo = (np.abs(X[:, :, f] + bound) < CLIP_TOL) & FM[:, :, f] & MK
+            cens_upper[:, :, f] = hit_hi
+            cens_lower[:, :, f] = hit_lo
+            hit = hit_hi | hit_lo
             for i in range(X.shape[0]):
                 if i not in keep_set:
                     continue
@@ -227,6 +238,12 @@ def main():
                     for k, v in ds["split"].items()}
     out["excluded_devices"] = [ids[i] for i in drop]
     out["n_points_masked_censored"] = int(n_masked)
+    out["censored_upper"] = cens_upper[keep]
+    out["censored_lower"] = cens_lower[keep]
+    out["censoring_bounds"] = {n: CLIP_BOUNDS.get(n, DEFAULT_CLIP)
+                               for n in cfg.FEATURES}
+    log.info("censored cells retained as directional flags: %d upper, %d lower",
+             int(cens_upper[keep].sum()), int(cens_lower[keep].sum()))
     out["excluded_reason"] = ("catastrophic degradation dominating aggregate "
                               "statistics; see 28_filter_extreme_devices.py")
     out["source_dataset"] = args.source
