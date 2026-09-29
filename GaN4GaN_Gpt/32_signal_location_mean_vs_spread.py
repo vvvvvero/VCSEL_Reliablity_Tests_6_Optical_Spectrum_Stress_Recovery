@@ -89,7 +89,7 @@ model.eval()
 
 ds = pickle.load(open(cfg.PROCESSED_DATA_PATH, "rb"))
 from torch.utils.data import DataLoader
-tm = mods["train"]; P = 6
+tm = mods["train"]; P = cfg.STAGE3_PREFIX_LEN
 dl = DataLoader(tm.DeviceDegradationDataset(ds, list(range(len(ds["device_ids"])))),
                 batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=tm.collate_fn)
 cache = s4a._cache_trajectories(model, dl, "cpu", tm._forward, P)

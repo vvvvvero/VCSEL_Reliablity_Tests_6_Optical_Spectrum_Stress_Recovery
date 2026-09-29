@@ -73,7 +73,7 @@ model.eval()
 ds = pickle.load(open(cfg.PROCESSED_DATA_PATH, "rb"))
 from torch.utils.data import DataLoader
 tm = mods["train"]
-P = 6
+P = cfg.STAGE3_PREFIX_LEN
 idx = list(range(len(ds["device_ids"])))
 dl = DataLoader(tm.DeviceDegradationDataset(ds, idx), batch_size=cfg.BATCH_SIZE,
                 shuffle=False, collate_fn=tm.collate_fn)

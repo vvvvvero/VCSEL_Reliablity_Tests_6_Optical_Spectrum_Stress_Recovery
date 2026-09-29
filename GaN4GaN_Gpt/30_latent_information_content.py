@@ -71,7 +71,8 @@ Tk = torch.tensor(np.asarray(ds["T_K"]), dtype=torch.float32)
 th = torch.tensor(np.asarray(ds["times_h"]), dtype=torch.float32)
 x0 = torch.tensor(np.asarray(ds["x0_static"]), dtype=torch.float32)
 FM = torch.tensor(np.asarray(ds["feature_mask"]), dtype=torch.bool)
-P = 6  # prefix boundary used by Stage 4C
+P = cfg.STAGE3_PREFIX_LEN  # prefix boundary, from config -- was hard-coded
+                           # to 6 while the pipeline uses 4
 
 # Encoder input exactly as 08_training.py builds it:
 # [x(11), feature_mask(11), T_norm, log_t, delta_log_t] -> 25
