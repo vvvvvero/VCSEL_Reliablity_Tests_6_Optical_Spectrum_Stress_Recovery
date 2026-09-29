@@ -337,6 +337,9 @@ def main():
                     help="fraction of TRAIN devices to use (learning curve)")
     ap.add_argument("--ood", action="store_true",
                     help="train on 275+300 C only, test on held-out 325 C")
+    ap.add_argument("--save-checkpoint", action="store_true",
+                    help="write the trained weights so trajectories can be "
+                         "recovered without retraining")
     ap.add_argument("--dataset", type=str, default=None,
                     help="default: processed_data_ext.pkl when EXTENDED_FEATURES")
     ap.add_argument("--output-dir", type=str,
@@ -430,6 +433,18 @@ def main():
         "dataset": ds_path, "features_scored": [cfg.FEATURES[i] for i in feat_idx],
     }
     tag = f"{args.mode}_frac{args.data_frac:.2f}{'_ood' if args.ood else ''}_seed{args.seed}"
+
+    # The trained weights were previously discarded, so a baseline's forecast
+    # trajectory could not be recovered without retraining. Saved on request so
+    # the same model that produced the reported RMSE can be plotted.
+    if args.save_checkpoint:
+        ck = os.path.join(args.output_dir, f"{tag}.pt")
+        torch.save({"mode": args.mode, "seed": args.seed, "hidden_dim": args.hidden_dim,
+                    "dataset": ds_path, "val_loss": val_loss,
+                    "test_rmse": res_test["rmse_overall"],
+                    "model_state": model.state_dict()}, ck)
+        log.info("checkpoint -> %s", ck)
+
     path = os.path.join(args.output_dir, f"{tag}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
