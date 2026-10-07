@@ -729,22 +729,50 @@ class SpectrometerStressRecoveryGUI(QMainWindow):
     def _connect_spec(self):
         try:
             if self.spec.connected:
-                self.spec.disconnect()
+                self.spec.cleanup()
                 self.btn_spec.setText('Connect Spectrometer')
                 self._log('Spectrometer disconnected')
                 return
 
-            self.spec.initialize()
-            self.spec.connect_device()
+            self._log('Initialising spectrometer...')
+
+            if not self.spec.initialize():
+                QMessageBox.warning(self, 'Spectrometer', 'Failed to initialise SDK')
+                self._log('Spectrometer init failed')
+                return
+
+            if not self.spec.connect_device(0):
+                QMessageBox.warning(self, 'Spectrometer', 'No spectrometer device found')
+                self._log('Spectrometer connect failed: no device found or activation failed')
+                return
 
             self.btn_spec.setText('Disconnect Spectrometer')
-            self._log('Spectrometer connected')
+            wl = self.spec.wavelength or []
+            if wl:
+                self._log(
+                    f'Spectrometer connected: {self.spec.num_pixels}px '
+                    f'{wl[0]:.0f}-{wl[-1]:.0f}nm'
+                )
+            else:
+                self._log('Spectrometer connected')
 
         except Exception as e:
             QMessageBox.critical(self, 'Spectrometer connection error', str(e))
 
     def _start(self):
         if self.worker and self.worker.isRunning():
+            return
+
+        need_spec = self.stress_widget.spec_enabled.isChecked() or \
+            self.recovery_widget.spec_enabled.isChecked()
+        if need_spec and not self.spec.connected:
+            QMessageBox.warning(
+                self,
+                'Spectrometer not connected',
+                'Spectrometer acquisition is enabled, but no spectrometer is connected. '
+                'Please connect spectrometer first.'
+            )
+            self._log('Start blocked: spectrometer enabled but not connected')
             return
 
         device = _safe_name(self.device_name.text())
@@ -780,6 +808,11 @@ class SpectrometerStressRecoveryGUI(QMainWindow):
         self.progress.setValue(0)
 
         self._log(f'Session root: {session}')
+        self._log(
+            f'Spectrometer precheck: connected={self.spec.connected}, '
+            f'stress_enabled={stress_cfg.spec.enabled}, '
+            f'recovery_enabled={recovery_cfg.spec.enabled}'
+        )
 
         self.worker.start()
 
@@ -818,7 +851,7 @@ class SpectrometerStressRecoveryGUI(QMainWindow):
                 self.b1500.disconnect()
 
             if self.spec.connected:
-                self.spec.disconnect()
+                self.spec.cleanup()
 
         finally:
             event.accept()
