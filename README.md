@@ -179,8 +179,7 @@ Contributions are welcome! Please feel free to submit pull requests or open issu
 ## Author
 
 **Veronica GaoZhan**  
-Centrum Łukasiewicz - Institute of Microelectronics and Photonics  
-June 2026
+
 
 ## License
 
