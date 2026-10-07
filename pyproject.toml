@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcsel-spectrum-stress-recovery"
+version = "1.0.0"
+description = "B1500 + Avantes Spectrometer two-phase stress/recovery cycling test with PyQt5 GUI"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Veronica GaoZhan", email = "veronica.gaozhan@centrum.cz"}
+]
+keywords = ["VCSEL", "testing", "stress", "recovery", "optical", "spectrum"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Development Status :: 4 - Beta",
+]
+dependencies = [
+    "PyQt5>=5.15.0",
+    "pyvisa>=1.12.0",
+    "numpy>=1.20.0",
+    "matplotlib>=3.3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=6.0", "black>=21.0", "flake8>=3.9.0"]
+
+[project.urls]
+Homepage = "https://github.com/vvvvvero/VCSEL_Reliablity_Tests_6_Optical_Spectrum_Stress_Recovery"
+Repository = "https://github.com/vvvvvero/VCSEL_Reliablity_Tests_6_Optical_Spectrum_Stress_Recovery.git"
+Issues = "https://github.com/vvvvvero/VCSEL_Reliablity_Tests_6_Optical_Spectrum_Stress_Recovery/issues"
+
+[project.scripts]
+vcsel-stress-recovery = "b1500_spectrometer_stress_rcovery_cycle:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
