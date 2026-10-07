@@ -1,4 +1,4 @@
-# VCSEL Optical Spectrum Stress/Recovery Cycling Test
+# VCSEL Reliability Tests - Series 6: Optical Spectrum Stress Recovery Tests
 
 A comprehensive Python package for automated stress/recovery cycling tests on VCSELs (Vertical-Cavity Surface-Emitting Lasers) using Keysight B1500 Semiconductor Parameter Analyzer and Avantes Spectrometer.
 
