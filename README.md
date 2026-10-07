@@ -50,15 +50,8 @@ pip install -e .
 
 ### GUI Application
 
-Run the stress/recovery cycling test GUI:
-
 ```bash
 python b1500_spectrometer_stress_rcovery_cycle.py
-```
-
-Or use the desktop launcher batch file:
-```bash
-run_spectrometer_stress_recovery.bat
 ```
 
 ### Configuration
